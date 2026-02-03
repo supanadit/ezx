@@ -40,5 +40,10 @@ func (b *BOMRepository) List(ctx context.Context) ([]domain.BOM, error) {
 			License: "GPLv2",
 			Version: "1.37.0",
 		},
+		{
+			Name:    "curl",
+			Site:    "https://curl.se/",
+			License: "MIT",
+		},
 	}, nil
 }
