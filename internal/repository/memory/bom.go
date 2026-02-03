@@ -41,9 +41,19 @@ func (b *BOMRepository) List(ctx context.Context) ([]domain.BOM, error) {
 			Version: "1.37.0",
 		},
 		{
-			Name:    "curl",
+			Name:    "CURL",
 			Site:    "https://curl.se/",
 			License: "MIT",
+		},
+		{
+			Name:    "Automake",
+			Site:    "https://www.gnu.org/software/automake/",
+			License: "GPLv2+",
+		},
+		{
+			Name:    "Autoconf",
+			Site:    "https://www.gnu.org/software/autoconf/",
+			License: "GPLv2+",
 		},
 	}, nil
 }

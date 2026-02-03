@@ -25,6 +25,10 @@ func (b *LicenseRepository) List(ctx context.Context) ([]domain.License, error) 
 			Link: "https://www.gnu.org/licenses/old-licenses/gpl-2.0.html",
 		},
 		{
+			Name: "GPLv2+",
+			Link: "https://spdx.org/licenses/GPL-2.0-or-later.html",
+		},
+		{
 			Name: "GPLv3",
 			Link: "https://www.gnu.org/licenses/gpl-3.0.html",
 		},
