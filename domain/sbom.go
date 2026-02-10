@@ -1,6 +1,6 @@
 package domain
 
-type BOM struct {
+type SBOM struct {
 	Name    string
 	Site    string
 	License string

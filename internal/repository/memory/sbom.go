@@ -6,16 +6,16 @@ import (
 	"github.com/supanadit/ezx/domain"
 )
 
-type BOMRepository struct {
+type SBOMRepository struct {
 	// Nothing here because from memory
 }
 
-func NewBOMRepository() *BOMRepository {
-	return &BOMRepository{}
+func NewSBOMRepository() *SBOMRepository {
+	return &SBOMRepository{}
 }
 
-func (b *BOMRepository) List(ctx context.Context) ([]domain.BOM, error) {
-	return []domain.BOM{
+func (b *SBOMRepository) List(ctx context.Context) ([]domain.SBOM, error) {
+	return []domain.SBOM{
 		{
 			Name:    "ZIG",
 			Site:    "https://ziglang.org",
