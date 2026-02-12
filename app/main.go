@@ -41,6 +41,7 @@ func main() {
 						Process: domain.Process{
 							BinaryPath: "/usr/bin/pgbouncer",
 							Arguments:  []string{"/etc/pgbouncer/pgbouncer.ini"},
+							WorkingDir: "/etc/pgbouncer",
 						},
 						NeedParentReady: true,
 						Children: []domain.ProcessNode{
@@ -49,6 +50,7 @@ func main() {
 								Process: domain.Process{
 									BinaryPath: "/usr/bin/pgpool",
 									Arguments:  []string{"-n"},
+									WorkingDir: "/etc/pgpool",
 								},
 								NeedParentReady: true,
 							},
@@ -59,6 +61,7 @@ func main() {
 						Process: domain.Process{
 							BinaryPath: "/usr/bin/etcd",
 							Arguments:  []string{"--data-dir=/var/lib/etcd"},
+							WorkingDir: "/var/lib/etcd",
 						},
 					},
 				},
