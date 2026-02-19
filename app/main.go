@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/spf13/viper"
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/process"
 )
 
 func main() {
@@ -69,4 +71,20 @@ func main() {
 		},
 	}
 	_ = chain // Avoid unused variable error
+
+	chain_sample := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "hello-world",
+				Process: domain.Process{
+					BinaryPath: "/bin/echo",
+					Arguments:  []string{"Hello, EZX!"},
+					WorkingDir: "/tmp",
+				},
+			},
+		},
+	}
+	s := process.NewService()
+	s.Execute(context.TODO(), chain_sample.Roots[0])
+	fmt.Println("✅ EZX started successfully!")
 }
