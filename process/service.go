@@ -30,5 +30,13 @@ func (s *service) Execute(ctx context.Context, node domain.ProcessNode) (*exec.C
 		return nil, err
 	}
 
+	println("Process Started")
+
+	if err := cmd.Wait(); err != nil {
+		return nil, err
+	}
+
+	println("Process Finished")
+
 	return cmd, nil
 }
