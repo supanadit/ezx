@@ -77,9 +77,10 @@ func main() {
 			{
 				Name: "hello-world",
 				Process: domain.Process{
-					BinaryPath: "/bin/echo",
-					Arguments:  []string{"Hello, EZX!"},
-					WorkingDir: "/tmp",
+					BinaryPath:  "/bin/sh",
+					Arguments:   []string{"-c", "echo \"$GREETING\""},
+					Environment: []string{"GREETING=Hello, EZX!"},
+					WorkingDir:  "/tmp",
 				},
 			},
 		},

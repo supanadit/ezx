@@ -20,6 +20,7 @@ func NewService() Service {
 
 func (s *service) Execute(ctx context.Context, node domain.ProcessNode) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, node.Process.BinaryPath, node.Process.Arguments...)
+	cmd.Env = append(os.Environ(), node.Process.Environment...)
 	cmd.Env = node.Process.Environment
 	cmd.Dir = node.Process.WorkingDir
 
