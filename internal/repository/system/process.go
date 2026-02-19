@@ -19,7 +19,6 @@ func NewProcessNodeRepository(node domain.ProcessNode) *ProcessNodeRepository {
 func (s *ProcessNodeRepository) Execute(ctx context.Context) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, s.ProcessNode.Process.BinaryPath, s.ProcessNode.Process.Arguments...)
 	cmd.Env = append(os.Environ(), s.ProcessNode.Process.Environment...)
-	cmd.Env = s.ProcessNode.Process.Environment
 	cmd.Dir = s.ProcessNode.Process.WorkingDir
 
 	cmd.Stdout = os.Stdout
