@@ -75,12 +75,32 @@ func main() {
 	chainSample := domain.ProcessChain{
 		Roots: []domain.ProcessNode{
 			{
-				Name: "hello-world",
+				Name: "hello-world-parent-1",
 				Process: domain.Process{
 					BinaryPath:  "/bin/sh",
 					Arguments:   []string{"-c", "echo \"$GREETING\""},
 					Environment: []string{"GREETING=Hello, EZX!"},
 					WorkingDir:  "/tmp",
+				},
+				Children: []domain.ProcessNode{
+					{
+						Name: "hello-world-child-2",
+						Process: domain.Process{
+							BinaryPath: "/bin/sh",
+							Arguments:  []string{"-c", "echo \"Hello World from child 2!\""},
+							WorkingDir: "/tmp",
+						},
+						NeedParentReady: false,
+					},
+					{
+						Name: "hello-world-child-1",
+						Process: domain.Process{
+							BinaryPath: "/bin/sh",
+							Arguments:  []string{"-c", "echo \"Hello World from child 1!\""},
+							WorkingDir: "/tmp",
+						},
+						NeedParentReady: true,
+					},
 				},
 			},
 		},
