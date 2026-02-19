@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/process"
+	"github.com/supanadit/ezx/internal/repository/system"
 )
 
 func main() {
@@ -72,7 +72,7 @@ func main() {
 	}
 	_ = chain // Avoid unused variable error
 
-	chain_sample := domain.ProcessChain{
+	chainSample := domain.ProcessChain{
 		Roots: []domain.ProcessNode{
 			{
 				Name: "hello-world",
@@ -85,7 +85,7 @@ func main() {
 			},
 		},
 	}
-	s := process.NewService()
-	s.Execute(context.TODO(), chain_sample.Roots[0])
+	pn1 := system.NewProcessNodeRepository(chainSample.Roots[0])
+	pn1.Execute(context.Background())
 	fmt.Println("✅ EZX started successfully!")
 }
