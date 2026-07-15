@@ -7779,4 +7779,1671 @@ With metrics, ezx is **observable**:
 This is table stakes for any modern container runtime. The user
 doesn't need to ask for it — they expect it.
 
+### 17.12 OpenTelemetry support (v1.1+)
+
+Prometheus is the present. **OpenTelemetry (OTel) is the
+future.** Most organizations are standardizing on OTel for
+observability. ezx supports OTel as a **complementary**
+signal, not a replacement for Prometheus.
+
+| Aspect | Prometheus | OpenTelemetry |
+| -------- | ----------- | --------------- |
+| Metrics | ✅ Text format | ✅ Structured, multiple backends |
+| Traces | ❌ Not supported | ✅ Distributed traces |
+| Logs | ❌ Not supported | ✅ Correlated with traces |
+| Context propagation | ❌ Not supported | ✅ Cross-service context |
+| Vendor lock-in | Low (open standard) | Lower (any exporter) |
+| Complexity | Low | Medium (instrumentation + exporters) |
+| Deployment model | Pull (scraper polls) | Push (OTLP exporter) |
+
+OTel doesn't replace Prometheus — it **extends** it:
+
+- Prometheus metrics cover the "what is happening now" use case
+- OTel traces cover the "why is it happening" and "how did we
+  get here" use cases
+- OTel metrics can be **exported to Prometheus** via the OTel
+  Prometheus exporter, so both can coexist
+
+#### A. OTel traces for the ezx lifecycle
+
+The most valuable OTel feature for ezx is **traces**. A trace
+spans the entire ezx lifecycle, showing exactly where time is
+spent and where failures occur:
+
+```
+Trace: ezx_startup
+├── Span: config.load              (3ms)
+│   ├── Span: config.validate      (1ms)
+│   └── Span: config.render        (1ms)  ← file reconciliation
+├── Span: setup.execute           (2min 34s)
+│   ├── Span: step.apt_base         (15s)
+│   ├── Span: step.postgresql      (1min 45s)
+│   └── Span: step.pgbouncer      (33s)
+├── Span: runtime.init            (5ms)
+├── Span: process.start            (2s)
+│   ├── Span: postmaster           (1.5s)
+│   └── Span: pgbouncer            (0.5s)
+├── Span: file.render             (10ms)
+│   └── Span: pg_hba.conf         (5ms)
+└── Span: plugin.setup             (100ms)
+    └── Span: myplugin.onSetup     (95ms)
+```
+
+When a user reports "ezx doesn't start," a single trace ID
+shows exactly which span failed and why.
+
+The trace model for ezx:
+
+```go
+// domain/telemetry.go
+type Tracer interface {
+    StartSpan(ctx context.Context, name string, opts ...SpanOption) (Span, context.Context)
+}
+
+type Span interface {
+    End()
+    SetStatus(code StatusCode, description string)
+    RecordError(err error, opts ...EventOption)
+    SetAttributes(attrs ...attribute.KeyValue)
+    AddEvent(name string, opts ...EventOption)
+}
+```
+
+Key spans:
+
+| Span name | When | Attributes |
+| ----------- | ------ | ------------ |
+| `ezx.startup` | ezx process starts | version, commit, os, arch |
+| `config.load` | Loading `ezx.setup.yaml` / `ezx.runtime.yaml` | path, format |
+| `config.validate` | Schema validation | step_count, process_count |
+| `config.render` | Template rendering | template_count, error_count |
+| `setup.execute` | Setup phase runs | step_count, duration |
+| `setup.step.{name}` | Individual setup step | step_name, type, duration |
+| `runtime.init` | Runtime phase initializes | chain_length, root_count |
+| `process.start` | Process starts | name, binary, pid |
+| `process.stop` | Process stops | name, signal, exit_code |
+| `process.restart` | Process restarts | name, reason, attempt |
+| `file.render` | File is rendered | file, mode, drift_detected |
+| `plugin.setup` | Plugin setup hook | plugin_name, version |
+| `plugin.runtime` | Plugin runtime hook | plugin_name |
+| `plugin.shutdown` | Plugin shutdown hook | plugin_name |
+| `signal.receive` | Signal received | signal, handled |
+| `ezx.shutdown` | ezx exits | exit_code, signal |
+
+#### B. Architecture
+
+The OTel support lives under the existing `telemetry/` package:
+
+```
+ezx/
+├── telemetry/
+│   ├── service.go                  # coordinates metrics + traces
+│   ├── prometheus/                 # Prometheus metrics (existing)
+│   │   ├── collector.go
+│   │   └── exporter.go
+│   └── otel/                       # NEW — OpenTelemetry
+│       ├── provider.go             # trace provider setup
+│       ├── exporter.go             # OTLP / Jaeger / Zipkin
+│       ├── propagator.go           # context propagation
+│       └── resource.go             # resource attributes
+├── domain/
+│   └── telemetry.go                # Tracer, Span interfaces
+```
+
+The `telemetry/service.go` is the use case that coordinates both
+Prometheus metrics and OTel traces. It exposes a `Tracer()
+Tracer` method that the rest of the codebase uses:
+
+```go
+// process/service.go
+func (s *Service) StartProcess(ctx context.Context, name string, cfg ProcessConfig) error {
+    span, ctx := s.tracer.StartSpan(ctx, "process.start",
+        attribute.String("process.name", name),
+        attribute.String("process.binary", cfg.BinaryPath),
+    )
+    defer span.End()
+
+    err := s.start(ctx, name, cfg)
+    if err != nil {
+        span.RecordError(err)
+        span.SetStatus(otelcodes.Error, err.Error())
+        return err
+    }
+    span.SetStatus(otelcodes.Ok, "")
+    return nil
+}
+```
+
+#### C. Configuration
+
+```yaml
+# ezx.setup.yaml or ezx.runtime.yaml
+telemetry:
+  # Prometheus (v1)
+  prometheus:
+    enabled: true
+    bind_address: ":8080"
+  
+  # OpenTelemetry (v1.1+)
+  otel:
+    enabled: true
+    # Exporter configuration
+    exporter:
+      type: otlp                    # otlp | jaeger | zipkin | stdout
+      endpoint: "otel-collector:4317"  # OTLP gRPC
+      # endpoint: "http://jaeger:14268" # Jaeger HTTP
+      # endpoint: "http://zipkin:9411"  # Zipkin HTTP
+      # type: stdout                  # for local debugging
+      insecure: false               # set true for local dev
+      headers:
+        x-api-key: "{{ .Env.OTEL_API_KEY }}"
+    
+    # Sampling (default: parent-based, 100% for root spans)
+    sampling:
+      type: parent_based            # parent_based | trace_id_ratio | always_on | always_off
+      ratio: 1.0                    # for trace_id_ratio: 0.0-1.0
+    
+    # Resource attributes (attached to every trace)
+    resource:
+      service.name: "ezx-postgresql"
+      service.version: "{{ .Env.EZX_VERSION }}"
+      deployment.environment: "{{ .Env.ENVIRONMENT }}"
+      host.name: "{{ .Env.HOSTNAME }}"
+      container.id: "{{ .Env.CONTAINER_ID }}"
+      k8s.pod.name: "{{ .Env.POD_NAME }}"
+      k8s.namespace.name: "{{ .Env.POD_NAMESPACE }}"
+```
+
+#### D. Plugin traces
+
+Plugins create child spans within ezx's trace:
+
+```go
+func (p *MyPlugin) OnSetup(ctx context.Context, req SetupRequest) error {
+    span, ctx := telemetry.SpanFromContext(ctx).StartChild("plugin.onSetup",
+        attribute.String("plugin.name", p.Name()),
+        attribute.String("plugin.version", p.Version()),
+    )
+    defer span.End()
+
+    // ... do setup work ...
+    // This work is nested under the "plugin.setup" span
+    // in ezx's trace
+
+    return nil
+}
+```
+
+The plugin's trace is **not a separate trace** — it's a child
+span within ezx's startup trace. This means:
+
+- When debugging ezx startup, you see exactly which plugin is slow
+- Plugin errors are visible in the ezx trace (no separate trace to find)
+- Plugin vendors don't need their own OTel setup
+
+#### E. OTel metrics bridge
+
+OTel metrics can be exported to Prometheus. This means:
+
+- v1.1+ users can use OTel for everything (traces + metrics + logs)
+- The Prometheus endpoint still works (via the OTel Prometheus exporter)
+- Users get unified observability without dual instrumentation
+
+```yaml
+telemetry:
+  prometheus:
+    enabled: true                    # still works, but now via OTel bridge
+    bind_address: ":8080"
+  otel:
+    enabled: true
+    exporter:
+      type: otlp
+      endpoint: "otel-collector:4317"
+    # The Prometheus endpoint serves OTel metrics translated
+    # to Prometheus text format
+```
+
+#### F. Sampling strategy
+
+Traces can be expensive (every span is sent over the network).
+Sampling controls the cost:
+
+| Strategy | Description | Use case |
+| ---------- | ------------- | ---------- |
+| `always_on` | 100% sampling | Development, debugging |
+| `always_off` | 0% sampling | Disable traces |
+| `trace_id_ratio` | Sample N% of traces | Production (1-10%) |
+| `parent_based` | Follow parent's decision | Default (child spans match parent) |
+
+The default is `parent_based` with a root ratio of 100% (all
+root spans are sampled, children follow the parent). This is
+good for ezx because:
+
+- ezx startup is infrequent (once per container lifecycle)
+- The cost of tracing startup is negligible
+- Debugging startup failures is the primary use case
+
+For long-running runtime spans (process monitoring, file
+reconciliation), the root span is sampled 100% and child spans
+follow. For high-frequency background tasks, users can lower
+the ratio.
+
+#### G. Security
+
+OTel traces can leak sensitive information:
+
+| Risk | Example | Mitigation |
+| ------ | --------- | ------------ |
+| Env var values | `attribute.String("password", "secret123")` | Never include values in attributes (names only) |
+| File paths | `attribute.String("file", "/etc/postgresql/16/main/...")` | Relative-ize to `{{ .Env.PGDATA }}` |
+| Plugin internals | Plugin may log sensitive data | Plugin is responsible for its own redaction |
+| Network exposure | OTLP endpoint on public network | Bind to localhost or use mTLS (v1.1+) |
+
+Mitigations:
+
+1. **Attribute allowlist**: only specific attributes are sent
+2. **Redaction**: values are replaced with `***REDACTED***`
+3. **Local endpoint**: OTLP defaults to localhost
+4. **mTLS**: mutual TLS for OTLP (v1.1+)
+
+#### H. v1 scope (updated)
+
+| Feature | v1 | v1.1+ | v1.2+ |
+| --------- | ---- | ------- | ------- |
+| Prometheus built-in metrics | ✅ | ✅ | ✅ |
+| HTTP `/metrics` endpoint | ✅ | ✅ | ✅ |
+| Unix socket default | ✅ | ✅ | ✅ |
+| `/health` endpoint | ✅ | ✅ | ✅ |
+| Plugin custom metrics | ❌ | ✅ | ✅ |
+| TLS + auth + allowlist | ❌ | ✅ | ✅ |
+| **OTel traces** | ❌ | **✅** | ✅ |
+| **OTel metrics (Prometheus bridge)** | ❌ | **✅** | ✅ |
+| **OTel logs** | ❌ | ❌ | **✅** |
+| Push model | ❌ | ❌ | ✅ |
+| Remote-write | ❌ | ❌ | ✅ |
+
+v1 ships with **Prometheus only**.
+v1.1 adds **OTel traces + OTel metrics bridge**.
+v1.2 adds **OTel logs + push/remote-write**.
+
+#### I. Why OTel matters
+
+Prometheus tells you **what** is happening (process up/down,
+memory usage, restart count). OTel traces tell you **why** and
+**how** it happened:
+
+- "Postgresql is down" (Prometheus alert)
+- → "Why?" → trace shows: config load OK → setup step
+  `apt-base` failed → network timeout fetching apt packages
+- "File drift detected" (Prometheus alert)
+- → "Why?" → trace shows: env var `PGDATA` changed →
+  `postgresql.conf` re-rendered → postgresql restarted
+
+Without traces, debugging ezx is reading logs (if you
+configured them) or `docker exec` into the container. With
+traces, a single trace ID tells the whole story.
+
+This is especially valuable for:
+
+- **CI/CD pipelines**: trace shows why a build failed
+- **Support tickets**: customer sends a trace ID, support sees
+  exactly what happened
+- **Post-mortems**: trace reconstructs the incident timeline
+- **Performance tuning**: trace shows which setup step is slow
+
+## 18. eBPF: kernel-level observability and security
+
+**eBPF** (extended Berkeley Packet Filter) is a Linux kernel
+technology that lets you run small, sandboxed programs inside
+the kernel without loading kernel modules or changing kernel
+source. Originally for network packet filtering, it now
+powers observability, security, and performance tools across
+the industry (Cilium, Falco, Pixie, bpftrace, tracee).
+
+### 18.1 What eBPF is, in plain English
+
+eBPF is **a way to ask the Linux kernel to notify you when
+something happens, and optionally run a small program in
+response**:
+
+- "Tell me when any process calls `fork()`"
+- "Tell me when any process opens a file under `/etc/`"
+- "Tell me when any process makes a network connection"
+- "Block any process from writing to `/etc/passwd`"
+
+These "programs" are:
+
+- **Small**: limited instruction count, limited stack, limited
+  memory
+- **Sandboxed**: verified by the kernel before loading (can't
+  crash the kernel, can't infinite loop)
+- **Fast**: run in kernel space, no user/kernel boundary crossing
+- **Event-driven**: the kernel calls your program when an event
+  happens, not the other way around
+
+### 18.2 Why eBPF matters for ezx
+
+ezx's current telemetry (§17) polls `/proc/<pid>/stat` every
+15 seconds. This is **simple but has problems**:
+
+| Problem | `/proc` polling | eBPF |
+| --------- | -------------- | ------ |
+| Race conditions | Process dies between PID check and stat read | **Event-driven: no races** |
+| Short-lived processes | Miss processes that start and exit between polls | **Catch every fork/exit** |
+| Overhead | Read `/proc` for every process every 15s | **Zero overhead when idle** |
+| Accuracy | Snapshot of state, not events | **Exact event stream** |
+| Security | Process can lie about its own state | **Kernel is the source of truth** |
+| File tracking | Not supported | **Trace every open/read/write** |
+| Network tracking | Not supported | **Trace every connect/send/recv** |
+| Syscall filtering | Not supported | **Enforce policies at kernel level** |
+
+eBPF transforms ezx's telemetry from **polling** ("ask the
+kernel every 15 seconds") to **event-driven** ("the kernel
+tells you when something happens").
+
+### 18.3 Concrete use cases for ezx
+
+#### A. Event-driven process monitoring (telemetry)
+
+Instead of:
+
+```go
+// Current approach: poll /proc every 15s
+for _, proc := range processes {
+    stat, _ := readProcStat(proc.PID)    // racy!
+    if stat != nil {
+        metrics.ProcessMemory.WithLabelValues(proc.Name).Set(stat.RSS)
+    }
+}
+```
+
+eBPF approach:
+
+```c
+// eBPF program (loaded once at startup)
+SEC("tracepoint/sched/sched_process_fork")
+int trace_fork(struct trace_event_raw_sched_process_fork *ctx) {
+    u32 pid = ctx->child_pid;
+    // Report: new process started
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &pid, sizeof(pid));
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int trace_exit(struct trace_event_raw_sched_process_exit *ctx) {
+    u32 pid = ctx->pid;
+    // Report: process exited
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &pid, sizeof(pid));
+    return 0;
+}
+```
+
+The Go side:
+
+```go
+// ezx reads events from a ring buffer
+for event := range ebpfEvents {
+    switch event.Type {
+    case ProcessFork:
+        metrics.ProcessUp.WithLabelValues(event.Name).Set(1)
+    case ProcessExit:
+        metrics.ProcessUp.WithLabelValues(event.Name).Set(0)
+        metrics.ProcessExitCode.WithLabelValues(event.Name, event.Signal).Set(event.ExitCode)
+    }
+}
+```
+
+**Result**: instant, accurate, zero-overhead process monitoring.
+Short-lived processes (e.g., a `pg_ctl` command during setup)
+are caught even if they exit in milliseconds.
+
+#### B. File access auditing (security)
+
+eBPF LSM (Linux Security Modules) hooks can track what files
+each process accesses:
+
+```c
+SEC("lsm/file_permission")
+int trace_file_permission(struct file *file, int mask) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    // Check: is this an ezx-managed process?
+    if (is_managed_process(pid)) {
+        char path[256];
+        bpf_d_path(&file->f_path, path, sizeof(path));
+        // Report: process X accessed file Y with mode Z
+        report_file_access(pid, path, mask);
+    }
+    return 0;   // allow the operation
+}
+```
+
+ezx exposes this as:
+
+```
+# Prometheus metric
+ezx_process_file_access_total{name="postmaster",path="/var/lib/postgresql/data/postgresql.conf",mode="read"} 42
+ezx_process_file_access_total{name="postmaster",path="/etc/passwd",mode="read"} 1
+# ↑ This is suspicious: postmaster shouldn't read /etc/passwd
+```
+
+Security team gets **real-time file access auditing** without
+modifying the managed processes.
+
+#### C. Network connection tracking (security + observability)
+
+eBPF tracks every network connection made by managed processes:
+
+```c
+SEC("kprobe/tcp_connect")
+int trace_tcp_connect(struct sock *sk) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (is_managed_process(pid)) {
+        struct sockaddr_in addr;
+        bpf_probe_read(&addr, sizeof(addr), sk);
+        report_connection(pid, addr.sin_addr, addr.sin_port);
+    }
+    return 0;
+}
+```
+
+ezx exposes:
+
+```
+ezx_process_network_connections_total{name="postmaster",dst_ip="10.0.0.5",dst_port="5432"} 1
+ezx_process_network_connections_total{name="pgbouncer",dst_ip="10.0.0.5",dst_port="5432"} 1
+# ↑ Shows the postgres → pgbouncer connection
+```
+
+This is **network topology discovery from the kernel** —
+useful for debugging, security audits, and compliance.
+
+#### D. Syscall filtering (runtime security)
+
+eBPF LSM hooks can **enforce policies** at the kernel level:
+
+```c
+SEC("lsm/socket_connect")
+int restrict_socket_connect(struct sock *sk, struct sockaddr *addr, int addrlen) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (is_managed_process(pid)) {
+        // Policy: postmaster can only connect to 10.0.0.0/8
+        struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+        if ((sin->sin_addr.s_addr & 0xFF) != 10) {
+            return -EPERM;   // deny connection
+        }
+    }
+    return 0;   // allow
+}
+```
+
+ezx's `ezx.runtime.yaml` declares policies, eBPF enforces
+them:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          # NEW: runtime security policy (v2.0)
+          security:
+            ebpf:
+              allowed_ips: ["10.0.0.0/8"]
+              denied_paths: ["/etc/passwd", "/etc/shadow"]
+              allowed_syscalls: ["read", "write", "open", "close", "mmap", "exit"]
+```
+
+This is **runtime security without seccomp** — more flexible
+(no static BPF filter to write), more granular (per-process
+policies), and more observable (every deny is a metric event).
+
+### 18.4 Architecture
+
+The eBPF support lives under `internal/repository/system/ebpf/`:
+
+```
+ezx/
+├── internal/
+│   └── repository/
+│       └── system/
+│           └── ebpf/               # NEW — eBPF programs
+│               ├── loader.go       # load/unload eBPF programs
+│               ├── process_monitor.c    # tracepoint probes
+│               ├── process_monitor.go   # Go bindings
+│               ├── file_audit.c         # LSM file hooks
+│               ├── file_audit.go        # Go bindings
+│               ├── network_tracker.c    # kprobe network hooks
+│               ├── network_tracker.go   # Go bindings
+│               ├── security_policy.c    # LSM policy hooks
+│               └── security_policy.go   # Go bindings
+├── telemetry/
+│   ├── service.go                  # coordinates metrics + traces
+│   └── ebpf_collector.go           # consumes eBPF events
+└── security/
+│   └── service.go                  # runtime security policies
+```
+
+eBPF programs are written in **C**, compiled to BPF bytecode
+using clang, and loaded into the kernel via the
+`bpf()` syscall. The Go side uses `cilium/ebpf` (the
+standard Go eBPF library):
+
+```go
+// internal/repository/system/ebpf/loader.go
+package ebpf
+
+import (
+    "github.com/cilium/ebpf"
+    "github.com/cilium/ebpf/perf"
+)
+
+type ProcessMonitor struct {
+    progFork   *ebpf.Program
+    progExit   *ebpf.Program
+    events     *perf.Reader
+}
+
+func LoadProcessMonitor() (*ProcessMonitor, error) {
+    // Load compiled BPF bytecode from embedded ELF
+    spec, err := ebpf.LoadCollectionSpec("process_monitor.o")
+    if err != nil {
+        return nil, err
+    }
+    // ... attach to tracepoints ...
+}
+```
+
+The BPF bytecode (`*.o` files) is **embedded into the ezx
+binary** at compile time using `go:embed`, so ezx is still a
+single static binary.
+
+### 18.5 Kernel requirements and limitations
+
+eBPF is **powerful but constrained**:
+
+| Requirement | Details | Impact |
+| ------------- | --------- | -------- |
+| Kernel version | 5.x+ for LSM hooks, 4.x+ for tracepoints | Container hosts need modern kernels |
+| Privileges | CAP_BPF (Linux 5.8+) or root | Container needs `--cap-add=CAP_BPF` |
+| Architecture | x86_64, arm64 supported | Others may need conditional compilation |
+| Verification | Kernel verifier rejects invalid programs | Complex programs may be rejected |
+| Instruction limit | 1M instructions (kernel 5.3+) | Sufficient for ezx's use cases |
+| Map size | Limited by `ulimit -l` | Configurable |
+| Development | Write C, compile with clang | Requires C knowledge |
+| Debugging | Hard; use `bpftool`, `perf` | Steep learning curve |
+
+**Practical implications**:
+
+- eBPF is **Linux-only** (matches ezx's target ✅)
+- eBPF requires **CAP_BPF** or root in containers
+- eBPF programs must be **compiled for the host architecture**
+- eBPF is **not portable across kernel versions** (tracepoint
+  structures change)
+- eBPF is **not a v1 feature** — it's v2.0 or later
+
+### 18.6 The `cilium/ebpf` library
+
+The standard Go library for eBPF is
+[`cilium/ebpf`](https://github.com/cilium/ebpf). It's
+maintained by the Cilium project and is the de facto standard:
+
+```go
+import "github.com/cilium/ebpf"
+
+// Load a compiled BPF program
+spec, err := ebpf.LoadCollectionSpec("monitor.o")
+coll, err := ebpf.NewCollection(spec)
+
+// Attach to a tracepoint
+prog := coll.Programs["trace_fork"]
+link, err := link.AttachTracepoint(link.TracepointOptions{
+    Group:   "sched",
+    Name:    "sched_process_fork",
+    Program: prog,
+})
+
+// Read events from a perf ring buffer
+reader, err := perf.NewReader(coll.Maps["events"], 4096)
+for {
+    record, err := reader.Read()
+    // Process the event
+}
+```
+
+`cilium/ebpf` handles:
+
+- Loading BPF bytecode
+- Creating BPF maps
+- Attaching to kprobes/tracepoints/LSM hooks
+- Reading perf ring buffers
+- Map pinning (sharing maps between processes)
+
+### 18.7 eBPF vs. existing approaches
+
+| Approach | Pros | Cons | eBPF improvement |
+| ---------- | ------ | ------ | ----------------- |
+| `/proc` polling | Simple, no privileges | Racy, misses short-lived, overhead | **Event-driven, accurate, zero idle overhead** |
+| ptrace | Can intercept syscalls | Slow, invasive, changes process behavior | **No process modification, kernel-level** |
+| auditd | Kernel-level auditing | Heavy, complex rules, log parsing | **Lightweight, metric-friendly, programmable** |
+| seccomp | Static syscall filtering | Inflexible, hard to write BPF filters | **Dynamic, per-process, observable denies** |
+| Falco | eBPF-based security | External tool, separate binary | **Built into ezx, unified with telemetry** |
+| Cilium | eBPF networking | Kubernetes-only, external | **Any Linux container, built into ezx** |
+
+### 18.8 Security implications of eBPF
+
+eBPF itself is a **security-sensitive capability**:
+
+| Risk | Mitigation |
+| ------ | ------------ |
+| eBPF programs can read any kernel memory | Verified by kernel verifier (read-only for safety) |
+| eBPF programs can leak data | ezx's BPF programs are embedded, auditable, signed |
+| Loading eBPF requires CAP_BPF | Container drops all caps except CAP_BPF (if needed) |
+| Malicious BPF bytecode | Only load embedded bytecode, never external |
+| Privilege escalation via BPF | Kernel verifier prevents this (no arbitrary writes) |
+
+For ezx:
+
+1. **Embedded only**: BPF bytecode is compiled at build time and
+   embedded in the ezx binary. Never load external BPF.
+2. **Signed**: BPF bytecode is signed with the ezx release key.
+3. **Auditable**: BPF source is in the repo (`*.c` files).
+4. **Minimal privileges**: container runs with `--cap-drop=ALL
+   --cap-add=CAP_BPF` (v2.0+ security model).
+
+### 18.9 v1 scope
+
+| Feature | v1 | v1.1+ | v2.0+ | Research |
+| --------- | ---- | ------- | ------- | ---------- |
+| `/proc` polling (current) | ✅ | ✅ | ✅ | ✅ |
+| eBPF process monitoring | ❌ | ❌ | **✅** | ✅ |
+| eBPF file audit | ❌ | ❌ | **✅** | ✅ |
+| eBPF network tracking | ❌ | ❌ | **✅** | ✅ |
+| eBPF syscall filtering | ❌ | ❌ | **✅** | ✅ |
+| eBPF security policies | ❌ | ❌ | **✅** | ✅ |
+
+**v1**: `/proc` polling is sufficient. eBPF is explicitly out of
+scope.
+
+**v2.0**: eBPF replaces `/proc` polling in telemetry. File audit,
+network tracking, and security policies are v2.0 features.
+
+**Research**: Investigate whether eBPF can be loaded without
+root/CAP_BPF using unprivileged eBPF (kernel 5.2+, limited
+capabilities).
+
+### 18.10 Why eBPF matters
+
+Without eBPF, ezx's telemetry is **polling-based**:
+
+- May miss short-lived processes
+- Has race conditions
+- Adds overhead even when idle
+- Can't audit file access
+- Can't track network connections
+- Can't enforce runtime security policies
+
+With eBPF, ezx's telemetry is **event-driven and kernel-level**:
+
+- Every process event is captured
+- Zero overhead when idle
+- Tamper-proof (kernel is the source of truth)
+- File and network auditing
+- Runtime security enforcement
+
+**But**: eBPF is complex, requires modern kernels, and needs
+root/CAP_BPF. It's a **v2.0 enhancement**, not a v1
+requirement. The design documents it now so the architecture
+has room for it.
+
+### 18.11 The user's question: "is it important?"
+
+**Honest answer**: eBPF is **important for advanced
+observability and security** but **not critical for ezx v1**.
+
+For ezx v1:
+
+- `/proc` polling is sufficient ✅
+- The telemetry is accurate enough for alerting ✅
+- Security is handled by seccomp, capabilities, read-only root ✅
+
+For ezx v2.0:
+
+- eBPF provides better telemetry (event-driven, no races) ✅
+- eBPF provides security auditing (file access, network) ✅
+- eBPF provides runtime enforcement (syscall filtering) ✅
+
+**Recommendation**: document eBPF as a v2.0 research direction,
+not a v1 requirement. The architecture has hooks for it
+(`telemetry/` and `security/` packages), but v1 doesn't need
+the complexity.
+
+## 19. Error handling and resilience
+
+A container orchestrator that panics on the first error is
+useless in production. ezx needs a systematic error handling
+strategy that distinguishes between fatal errors (ezx cannot
+continue), recoverable errors (ezx retries), and graceful
+degradation (ezx continues with reduced functionality).
+
+### 19.1 Error taxonomy
+
+ezx classifies all errors into four categories:
+
+| Category | Severity | Behavior | Examples |
+| ---------- | ---------- | ---------- | ---------- |
+| **Fatal** | Critical | Exit immediately | Invalid YAML schema, missing required env var, plugin load failure |
+| **Retryable** | Warning | Retry with backoff | Network timeout during setup, transient process start failure |
+| **Degradable** | Warning | Continue, log warning | One plugin fails but others work, optional metric unavailable |
+| **Expected** | Info | Log and continue | Process exits with code 0 (normal shutdown), child process restart |
+
+This taxonomy is reflected in the error types:
+
+```go
+// domain/errors.go
+package domain
+
+import "fmt"
+
+type ErrorKind int
+
+const (
+    ErrorKindFatal       ErrorKind = iota // ezx exits
+    ErrorKindRetryable                    // retry with backoff
+    ErrorKindDegradable                   // continue, reduce functionality
+    ErrorKindExpected                     // log and continue
+)
+
+type EZXError struct {
+    Kind    ErrorKind
+    Code    string            // machine-readable: "E001", "E002", ...
+    Message string            // human-readable
+    Cause   error             // underlying error, if any
+    Context map[string]any    // structured context
+}
+
+func (e *EZXError) Error() string { return e.Message }
+func (e *EZXError) Unwrap() error  { return e.Cause }
+
+// Usage:
+// return &EZXError{
+//     Kind:    ErrorKindRetryable,
+//     Code:    "E104",
+//     Message: "failed to start postmaster: connection refused",
+//     Cause:   err,
+//     Context: map[string]any{"process": "postmaster", "attempt": 3},
+// }
+```
+
+Error codes are documented in `docs/errors.md`:
+
+```
+E001  Fatal    ConfigLoadError          Failed to load ezx.setup.yaml
+E002  Fatal    ConfigValidationError    Schema validation failed
+E003  Fatal    PluginLoadError          Failed to load plugin
+E004  Fatal    PrivilegeError           Cannot drop privileges
+E101  Retryable ProcessStartError      Process failed to start
+E102  Retryable NetworkTimeoutError    Network timeout during setup
+E103  Retryable FileRenderError        File rendering failed (transient)
+E201  Degradable PluginRuntimeError    Plugin runtime hook failed
+E202  Degradable MetricUnavailable     Telemetry collector failed
+E301  Expected  ProcessExit            Process exited normally
+E302  Expected  ProcessRestart         Process restarted by supervisor
+E303  Expected  SignalReceived         Signal handled gracefully
+```
+
+### 19.2 Retry policy
+
+For retryable errors, ezx uses an exponential backoff with
+jitter:
+
+```go
+// domain/retry.go
+type RetryPolicy struct {
+    MaxAttempts     int           // default: 5
+    InitialDelay    time.Duration // default: 1s
+    MaxDelay        time.Duration // default: 30s
+    BackoffFactor   float64       // default: 2.0
+    JitterPercent   float64       // default: 0.25 (±25%)
+    RetryableCodes  []string      // which error codes to retry
+}
+
+func (p *RetryPolicy) NextDelay(attempt int) time.Duration {
+    delay := p.InitialDelay * time.Duration(math.Pow(p.BackoffFactor, float64(attempt)))
+    if delay > p.MaxDelay {
+        delay = p.MaxDelay
+    }
+    jitter := time.Duration(float64(delay) * p.JitterPercent * (rand.Float64()*2 - 1))
+    return delay + jitter
+}
+```
+
+Retry policy is configurable per-process:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          retry:
+            max_attempts: 10
+            initial_delay: 2s
+            max_delay: 60s
+            backoff_factor: 2.0
+```
+
+### 19.3 Circuit breaker
+
+If a process fails repeatedly, ezx opens a **circuit breaker**
+to prevent infinite retries:
+
+```go
+// domain/circuitbreaker.go
+type CircuitBreaker struct {
+    Name           string
+    FailureThreshold int           // default: 5 failures in window
+    Window         time.Duration   // default: 60s
+    Cooldown       time.Duration   // default: 30s
+    State          CircuitState    // Closed | Open | HalfOpen
+}
+
+func (cb *CircuitBreaker) RecordFailure() {
+    if cb.failuresInWindow() >= cb.FailureThreshold {
+        cb.State = Open
+        cb.openedAt = time.Now()
+    }
+}
+
+func (cb *CircuitBreaker) CanExecute() bool {
+    switch cb.State {
+    case Closed:
+        return true
+    case Open:
+        if time.Since(cb.openedAt) > cb.Cooldown {
+            cb.State = HalfOpen
+            return true
+        }
+        return false
+    case HalfOpen:
+        return true // next execution tests if it's recovered
+    }
+}
+```
+
+When the circuit is **Open**:
+
+- ezx stops trying to start the process
+- Emits a metric: `ezx_circuit_breaker_state{name="postmaster",state="open"} 1`
+- Logs an error: "circuit breaker open for postmaster: too many failures"
+- After cooldown, enters **HalfOpen** and tries once
+- If the single attempt succeeds → **Closed**, normal operation resumes
+- If the single attempt fails → **Open** again, with doubled cooldown
+
+This prevents "thundering herd" restart loops that exhaust
+system resources.
+
+### 19.4 Graceful degradation
+
+For degradable errors, ezx continues with reduced
+functionality:
+
+```go
+// Example: telemetry collector fails
+func (s *TelemetryService) Collect(ctx context.Context) error {
+    err := s.collector.Collect(ctx)
+    if err != nil {
+        // Log warning, emit metric, continue
+        s.logger.Warn("telemetry collection failed, continuing without metrics",
+            "error", err,
+            "collector", s.collector.Name(),
+        )
+        s.metrics.ErrorsTotal.WithLabelValues("telemetry", "collection_failed").Inc()
+        // Continue — don't crash ezx
+        return nil
+    }
+    return nil
+}
+```
+
+Degradable errors are always logged at `Warn` level, never
+cause a panic or exit. The user is notified via metrics and
+can investigate at their convenience.
+
+### 19.5 Process failure handling
+
+When a managed process exits unexpectedly, ezx follows this
+decision tree:
+
+```
+Process exits
+├── Exit code 0 (clean exit)
+│   ├── Expected exit (shutdown signal received)
+│   │   └── Log at INFO, don't restart
+│   └── Unexpected exit (no shutdown signal)
+│       └── Log at WARN, restart (if configured)
+├── Exit code 1 (error)
+│   ├── Is retryable? (e.g., port in use, file not found)
+│   │   └── Retry with backoff (max 5 attempts)
+│   └── Not retryable? (e.g., invalid config)
+│       └── Log at ERROR, stop process, don't restart
+│           (other processes continue)
+├── Exit code 137 (SIGKILL, typically OOM)
+│   └── Log at ERROR, restart immediately
+│       (OOM is often transient, retry once)
+├── Exit code 143 (SIGTERM)
+│   └── Log at INFO, expected shutdown
+├── Signal SIGKILL from ezx (administrative)
+│   └── Log at INFO, don't restart
+└── Any other exit code
+    └── Log at WARN, restart if configured
+```
+
+Per-process restart configuration:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          restart:
+            policy: always          # always | on-failure | unless-stopped | never
+            max_restarts: 5         # per hour, circuit breaker kicks in after
+            restart_delay: 5s     # initial delay between restarts
+```
+
+| Policy | Behavior |
+| -------- | ---------- |
+| `always` | Restart regardless of exit code |
+| `on-failure` | Restart only if exit code ≠ 0 |
+| `unless-stopped` | Restart unless explicitly stopped via API |
+| `never` | Never restart, exit is final |
+
+### 19.6 Fatal error handling
+
+Fatal errors cause ezx to exit with a non-zero code. Before
+exiting, ezx:
+
+1. Logs the error at FATAL level with full context
+2. Emits a metric: `ezx_fatal_errors_total{code="E001"} 1`
+3. Sends SIGTERM to all managed processes (graceful shutdown)
+4. Waits up to 30s for processes to exit
+5. Sends SIGKILL to any remaining processes
+6. Calls `OnShutdown()` on all plugins
+7. Exits with the error code
+
+```go
+// app/main.go
+func main() {
+    // ... setup ...
+    if err := app.Run(); err != nil {
+        var ezxErr *domain.EZXError
+        if errors.As(err, &ezxErr) {
+            log.Fatal("ezx fatal error",
+                "code", ezxErr.Code,
+                "kind", ezxErr.Kind,
+                "message", ezxErr.Message,
+            )
+        }
+        log.Fatal("unexpected error", "error", err)
+    }
+}
+```
+
+### 19.7 Integration with existing design
+
+- **§14 (Security)**: fatal errors during privilege dropping
+  (E004) are security-sensitive — logged but never expose
+  secrets
+- **§17 (Telemetry)**: every error emits a metric; retryable
+  errors emit `ezx_retry_attempts_total`
+- **§21 (Operational API)**: circuit breaker state is exposed
+  via the API; admin can manually reset a circuit breaker
+
+---
+
+## 20. Logging: structured, hot-reloadable, multi-destination
+
+Container orchestrators run in environments where `kubectl logs`
+or `docker logs` is the primary debugging interface. ezx's
+logging must be:
+
+- **Structured** (JSON) for machine parsing
+- **Level-configurable** for verbosity control
+- **Hot-reloadable** without container restart
+- **Multi-destination** (stdout, file, remote, syslog)
+
+### 20.1 Log format
+
+All logs are structured JSON (by default):
+
+```json
+{"ts":"2026-01-15T09:23:47.123Z","level":"INFO","msg":"process started","process":"postmaster","pid":42,"version":"1.0.0"}
+{"ts":"2026-01-15T09:23:47.456Z","level":"WARN","msg":"file drift detected","file":"/etc/postgresql/postgresql.conf","expected_checksum":"abc123","actual_checksum":"def456"}
+{"ts":"2026-01-15T09:23:48.001Z","level":"ERROR","msg":"process exited unexpectedly","process":"patroni","exit_code":1,"signal":"","attempt":3}
+```
+
+Fields:
+
+- `ts`: ISO8601 timestamp with millisecond precision
+- `level`: DEBUG, INFO, WARN, ERROR, FATAL
+- `msg`: Human-readable message
+- Additional fields are contextual (process name, PID, file path, etc.)
+
+Text format is available for local development:
+
+```
+2026-01-15T09:23:47.123Z  INFO  process started  process=postmaster  pid=42
+2026-01-15T09:23:47.456Z  WARN  file drift detected  file=/etc/postgresql/postgresql.conf
+```
+
+### 20.2 Log levels
+
+```go
+// domain/log.go
+type LogLevel int
+
+const (
+    LogLevelDebug LogLevel = iota
+    LogLevelInfo
+    LogLevelWarn
+    LogLevelError
+    LogLevelFatal
+)
+```
+
+Level behavior:
+
+| Level | Includes | Use case |
+| ------- | ---------- | ---------- |
+| `DEBUG` | Everything | Development, deep debugging |
+| `INFO` | INFO, WARN, ERROR, FATAL | Normal production (default) |
+| `WARN` | WARN, ERROR, FATAL | Reduced noise in stable environments |
+| `ERROR` | ERROR, FATAL | Critical issues only |
+| `FATAL` | Fatal only | Emergency debugging |
+
+### 20.3 Configuration
+
+```yaml
+# ezx.setup.yaml or ezx.runtime.yaml
+logging:
+  level: INFO                    # DEBUG | INFO | WARN | ERROR | FATAL
+  format: json                   # json | text
+  
+  # Multiple outputs (all active simultaneously)
+  outputs:
+    - type: stdout               # always active
+      # No additional config needed
+    
+    - type: file
+      path: /var/log/ezx/ezx.log
+      max_size: 100               # MB per file
+      max_backups: 5              # number of rotated files
+      max_age: 30                 # days to keep
+      compress: true              # gzip old files
+    
+    - type: remote
+      endpoint: https://logs.example.com/ingest
+      headers:
+        Authorization: "Bearer {{ .Env.LOG_API_TOKEN }}"
+      batch_size: 100             # lines per batch
+      flush_interval: 5s
+      retry:
+        max_attempts: 3
+        initial_delay: 1s
+    
+    - type: syslog
+      network: udp                # udp | tcp
+      address: "localhost:514"
+      tag: "ezx"
+      facility: LOCAL0
+```
+
+### 20.4 Hot reload without container restart
+
+The user explicitly asked: "hot reload without needing
+container or pod restarted." This is critical for production:
+
+```bash
+# Change log level without restarting the container
+$ ezx logs set-level DEBUG
+# Or via the operational API (§21):
+$ curl -X POST http://localhost:8081/api/v1/logging/level \
+  -H "Content-Type: application/json" \
+  -d '{"level": "DEBUG"}'
+```
+
+Implementation:
+
+```go
+// internal/repository/system/log.go
+type LogManager struct {
+    level     atomic.Value        // atomically swappable
+    outputs   []LogOutput
+    mu        sync.RWMutex
+}
+
+func (m *LogManager) SetLevel(level LogLevel) {
+    m.level.Store(level)
+    m.logger.Info("log level changed", "old_level", m.level, "new_level", level)
+}
+
+func (m *LogManager) ReloadConfig(cfg LoggingConfig) error {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    // Close old outputs
+    for _, out := range m.outputs {
+        out.Close()
+    }
+    
+    // Open new outputs
+    m.outputs = nil
+    for _, outCfg := range cfg.Outputs {
+        out, err := m.createOutput(outCfg)
+        if err != nil {
+            return fmt.Errorf("failed to create output %s: %w", outCfg.Type, err)
+        }
+        m.outputs = append(m.outputs, out)
+    }
+    
+    m.level.Store(cfg.Level)
+    return nil
+}
+```
+
+The log manager uses:
+
+- `atomic.Value` for the level (lock-free hot swap)
+- `sync.RWMutex` for output list (slower, but reconfiguration is rare)
+- **No container restart** — the change is live in milliseconds
+
+### 20.5 Log redaction
+
+Logs must never contain secrets. §14 already covers secrets
+in env vars. Logging extends this:
+
+```go
+// Redaction rules (configurable)
+var defaultRedactionRules = []RedactionRule{
+    {Pattern: regexp.MustCompile(`(?i)password\s*=\s*\S+`), Replace: "password=***REDACTED***"},
+    {Pattern: regexp.MustCompile(`(?i)token\s*=\s*\S+`), Replace: "token=***REDACTED***"},
+    {Pattern: regexp.MustCompile(`(?i)secret\s*=\s*\S+`), Replace: "secret=***REDACTED***"},
+    {Pattern: regexp.MustCompile(`(?i)api[_-]?key\s*=\s*\S+`), Replace: "api_key=***REDACTED***"},
+    {Pattern: regexp.MustCompile(`-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`), Replace: "***REDACTED: PRIVATE KEY***"},
+}
+
+func (m *LogManager) redact(msg string) string {
+    for _, rule := range m.redactionRules {
+        msg = rule.Pattern.ReplaceAllString(msg, rule.Replace)
+    }
+    return msg
+}
+```
+
+Additionally, structured log fields can be marked as
+sensitive:
+
+```go
+logger.Info("database connected",
+    "host", dbHost,
+    "port", dbPort,
+    "password", slog.String("password", dbPassword, slog.Secret()),
+    // ↑ The Secret() option marks this field for redaction
+)
+// Output: {"msg":"database connected","host":"db.example.com","port":5432,"password":"***REDACTED***"}
+```
+
+### 20.6 Plugin logging
+
+Plugins get a logger instance that's pre-configured with the
+current log level and redaction rules:
+
+```go
+type Extension interface {
+    // ... existing methods ...
+    
+    // Logger returns a plugin-scoped logger
+    Logger() Logger
+}
+
+// Plugin usage:
+func (p *MyPlugin) OnSetup(ctx context.Context, req SetupRequest) error {
+    p.Logger().Info("plugin setup started", "plugin", p.Name())
+    // Logs are prefixed with the plugin name: "plugin=myplugin"
+}
+```
+
+Plugin logs are tagged with `plugin=<name>` for filtering:
+
+```json
+{"ts":"...","level":"INFO","msg":"plugin setup started","plugin":"myplugin","version":"1.0.0"}
+```
+
+### 20.7 v1 scope
+
+| Feature | v1 | v1.1+ | v2.0+ |
+| --------- | ---- | ------- | ------- |
+| Structured JSON logging | ✅ | ✅ | ✅ |
+| Text format | ✅ | ✅ | ✅ |
+| stdout output | ✅ | ✅ | ✅ |
+| file output (with rotation) | ✅ | ✅ | ✅ |
+| Log levels (DEBUG-INFO-WARN-ERROR-FATAL) | ✅ | ✅ | ✅ |
+| Log redaction | ✅ | ✅ | ✅ |
+| Hot reload log level | ✅ | ✅ | ✅ |
+| Hot reload outputs | ❌ | ✅ | ✅ |
+| remote output (HTTP ingestion) | ❌ | ✅ | ✅ |
+| syslog output | ❌ | ✅ | ✅ |
+| Plugin-scoped loggers | ❌ | ✅ | ✅ |
+| Custom redaction rules (user-defined) | ❌ | ✅ | ✅ |
+| Log sampling (reduce DEBUG volume) | ❌ | ❌ | ✅ |
+
+v1 ships with JSON/text logging to stdout and file, with hot
+level reload via API. Output reconfiguration and remote/syslog
+are v1.1+.
+
+---
+
+## 21. Operational API: runtime control without restart
+
+The user explicitly asked for "restart certain component by
+rest API." This is the **operational API**: a control plane
+that lets operators inspect and manipulate ezx's runtime
+state without restarting the container or pod.
+
+This is different from the telemetry endpoint (§17). The
+telemetry endpoint is **read-only** and **unauthenticated**
+(or lightly authenticated). The operational API is **read-
+write** and **strongly authenticated** — it can restart
+processes, reload config, and drain traffic.
+
+### 21.1 Architecture
+
+```
+ezx/
+├── operational/                    # NEW use case
+│   ├── service.go                    # HTTP server, route dispatch
+│   ├── handlers.go                   # REST handlers
+│   ├── auth.go                       # authentication/authorization
+│   └── types.go                      # request/response types
+├── internal/
+│   └── repository/
+│       └── system/
+│           └── api.go                # bind to Unix socket or TCP
+```
+
+The operational API runs on a **separate socket** from the
+telemetry endpoint:
+
+```yaml
+# ezx.setup.yaml or ezx.runtime.yaml
+operational_api:
+  enabled: true
+  # Unix socket (default, most secure):
+  bind_address: "unix:///var/run/ezx/api.sock"
+  # TCP (for remote access, requires auth + TLS):
+  # bind_address: ":8081"
+  
+  # Authentication (v1.1+):
+  # auth:
+  #   type: bearer_token
+  #   token_file: /etc/ezx/api-token
+  # 
+  # TLS (v1.1+):
+  # tls:
+  #   cert_file: /etc/ezx/tls/api.crt
+  #   key_file: /etc/ezx/tls/api.key
+```
+
+### 21.2 Endpoints
+
+#### Process management
+
+```bash
+# List all managed processes
+GET /api/v1/processes
+
+# Get specific process status
+GET /api/v1/processes/{name}
+
+# Start a process (if stopped)
+POST /api/v1/processes/{name}/start
+
+# Stop a process gracefully (SIGTERM)
+POST /api/v1/processes/{name}/stop
+
+# Restart a process (stop + start)
+POST /api/v1/processes/{name}/restart
+
+# Kill a process immediately (SIGKILL)
+POST /api/v1/processes/{name}/kill
+
+# Drain a process (stop accepting new work, let existing finish)
+POST /api/v1/processes/{name}/drain
+
+# Reset circuit breaker for a process
+POST /api/v1/processes/{name}/circuit-breaker/reset
+```
+
+Example response:
+
+```json
+// GET /api/v1/processes/postmaster
+{
+  "name": "postmaster",
+  "binary": "/usr/local/pgsql/bin/postgres",
+  "pid": 42,
+  "status": "running",
+  "uptime_seconds": 3600,
+  "restart_count": 0,
+  "circuit_breaker": "closed",
+  "last_exit_code": null,
+  "health": {
+    "ready": true,
+    "live": true,
+    "last_ready_probe": "2026-01-15T09:23:47Z"
+  }
+}
+```
+
+#### Config management
+
+```bash
+# Get current runtime config (sanitized, no secrets)
+GET /api/v1/config
+
+# Reload config (like SIGHUP, but via API)
+POST /api/v1/config/reload
+
+# Get current log configuration
+GET /api/v1/logging
+
+# Change log level (hot reload, no restart)
+POST /api/v1/logging/level
+# Body: {"level": "DEBUG"}
+
+# Change log outputs (hot reload)
+PUT /api/v1/logging/outputs
+# Body: {"outputs": [{"type": "stdout"}, {"type": "file", "path": "/var/log/ezx.log"}]}
+```
+
+Example:
+
+```bash
+# Hot reload log level without restarting container
+curl -X POST http://localhost:8081/api/v1/logging/level \
+  -H "Content-Type: application/json" \
+  -d '{"level": "DEBUG"}'
+
+# Restart just the pgbouncer process, leave postmaster running
+curl -X POST http://localhost:8081/api/v1/processes/pgbouncer/restart
+
+# Reload config after editing ezx.runtime.yaml
+curl -X POST http://localhost:8081/api/v1/config/reload
+```
+
+#### System state
+
+```bash
+# Get full runtime state (for debugging)
+GET /api/v1/state
+
+# Get build info
+GET /api/v1/info
+
+# Health check (same as §17.8 /health, but on the API socket)
+GET /api/v1/health
+
+# Drain the entire node (graceful shutdown preparation)
+POST /api/v1/drain
+# Body: {"timeout": "30s"}
+```
+
+Example response for `GET /api/v1/state`:
+
+```json
+{
+  "version": "1.0.0",
+  "uptime_seconds": 7200,
+  "config_path": "/etc/ezx/ezx.runtime.yaml",
+  "config_loaded_at": "2026-01-15T08:00:00Z",
+  "processes": [
+    {
+      "name": "postmaster",
+      "status": "running",
+      "pid": 42,
+      "uptime_seconds": 7200
+    },
+    {
+      "name": "pgbouncer",
+      "status": "running",
+      "pid": 43,
+      "uptime_seconds": 7200
+    },
+    {
+      "name": "patroni",
+      "status": "stopped",
+      "last_exit_code": 1,
+      "circuit_breaker": "open",
+      "circuit_breaker_opened_at": "2026-01-15T09:00:00Z"
+    }
+  ],
+  "plugins": [
+    {"name": "patroni-ha", "version": "1.0.0", "status": "loaded"}
+  ],
+  "file_renders": [
+    {"file": "/etc/postgresql/postgresql.conf", "status": "rendered", "drift": false},
+    {"file": "/etc/postgresql/pg_hba.conf", "status": "rendered", "drift": false}
+  ],
+  "circuit_breakers": [
+    {"name": "patroni", "state": "open", "failures": 5, "last_failure": "2026-01-15T09:00:00Z"}
+  ]
+}
+```
+
+### 21.3 Hot reload of config
+
+Config reload is the most important operational feature. The
+user asked: "hot reload without needing container or pod
+restarted."
+
+```bash
+# Method 1: SIGHUP (traditional)
+$ kill -HUP $(pgrep ezx)
+
+# Method 2: Operational API
+$ curl -X POST http://localhost:8081/api/v1/config/reload
+
+# Method 3: File watcher (optional, v1.1+)
+# ezx watches the config file and auto-reloads on change
+```
+
+What happens during a reload:
+
+```
+1. Parse new config (ezx.runtime.yaml)
+2. Validate against schema (§4)
+3. Detect changes:
+   ├── Process added → start it
+   ├── Process removed → stop it gracefully
+   ├── Process changed → restart it (if running) or start it (if stopped)
+   ├── File render spec changed → re-render files, restart affected processes
+   ├── Plugin added → call OnSetup, then OnRuntime
+   ├── Plugin removed → call OnShutdown, then unload
+   └── Log config changed → hot reload logging (§20.4)
+4. If validation fails: keep old config, return error
+5. If any step fails during transition: rollback to old config
+```
+
+The reload is **atomic** — either everything switches to the
+new config, or nothing does. No partial state.
+
+```go
+// operational/service.go
+func (s *Service) ReloadConfig(ctx context.Context) error {
+    // 1. Load new config
+    newConfig, err := s.configLoader.Load(s.configPath)
+    if err != nil {
+        return fmt.Errorf("failed to load new config: %w", err)
+    }
+    
+    // 2. Validate
+    if err := s.validator.Validate(newConfig); err != nil {
+        return fmt.Errorf("new config invalid: %w", err)
+    }
+    
+    // 3. Compute diff
+    diff := s.computeConfigDiff(s.currentConfig, newConfig)
+    
+    // 4. Apply changes (with rollback on failure)
+    if err := s.applyDiff(ctx, diff); err != nil {
+        s.rollback(ctx)
+        return fmt.Errorf("failed to apply config changes: %w", err)
+    }
+    
+    // 5. Swap config
+    s.currentConfig = newConfig
+    s.logger.Info("config reloaded successfully")
+    return nil
+}
+```
+
+### 21.4 Security: why the operational API is dangerous
+
+The operational API can restart processes, reload config, and
+drain traffic. If compromised, an attacker can:
+
+- Stop all processes (DoS)
+- Restart processes with malicious config
+- Exfiltrate config (which may contain sensitive data)
+- Change log level to DEBUG to capture sensitive data
+
+Security measures:
+
+1. **Unix socket by default**: no TCP port exposed. Only
+   accessible from within the container.
+2. **Authentication required for TCP** (v1.1+):
+   - Bearer token (shared secret)
+   - mTLS (client certificate)
+   - Unix socket peer credentials (UID/GID check)
+3. **Read-only by default**: the API is read-only unless
+   explicitly enabled with `--api-write`.
+4. **Audit logging**: every API call is logged with caller
+   identity and action taken.
+5. **Rate limiting**: prevent brute force on authentication.
+6. **IP allowlist**: only specific IPs can access the TCP
+   endpoint.
+
+```yaml
+operational_api:
+  enabled: true
+  bind_address: "unix:///var/run/ezx/api.sock"
+  # Security hardening (v1.1+):
+  # auth:
+  #   type: bearer_token
+  #   token_file: /etc/ezx/api-token
+  # rate_limit:
+  #   requests_per_second: 10
+  #   burst: 20
+  # audit_log:
+  #   path: /var/log/ezx/api-audit.log
+```
+
+### 21.5 Plugin API extensions
+
+Plugins can register their own API endpoints:
+
+```go
+type Extension interface {
+    // ... existing methods ...
+    
+    // RegisterAPI routes plugin-specific handlers
+    RegisterAPI(mux APIMux) error
+}
+
+type APIMux interface {
+    HandleFunc(pattern string, handler APIHandler)
+}
+
+type APIHandler func(ctx context.Context, req APIRequest) APIResponse
+```
+
+Example: a PostgreSQL HA plugin adds endpoints for failover
+control:
+
+```go
+func (p *HAPlugin) RegisterAPI(mux APIMux) error {
+    mux.HandleFunc("POST /api/v1/failover", p.handleFailover)
+    mux.HandleFunc("GET /api/v1/replication-status", p.handleReplicationStatus)
+    mux.HandleFunc("POST /api/v1/promote", p.handlePromote)
+    return nil
+}
+```
+
+The plugin's endpoints are namespaced under the plugin's
+route prefix: `/api/v1/plugins/{plugin_name}/...`.
+
+### 21.6 v1 scope
+
+| Feature | v1 | v1.1+ | v2.0+ |
+| --------- | ---- | ------- | ------- |
+| Unix socket API | ✅ | ✅ | ✅ |
+| `GET /api/v1/processes` | ✅ | ✅ | ✅ |
+| `GET /api/v1/processes/{name}` | ✅ | ✅ | ✅ |
+| `POST /api/v1/processes/{name}/restart` | ✅ | ✅ | ✅ |
+| `POST /api/v1/processes/{name}/stop` | ✅ | ✅ | ✅ |
+| `POST /api/v1/processes/{name}/start` | ✅ | ✅ | ✅ |
+| `POST /api/v1/processes/{name}/kill` | ✅ | ✅ | ✅ |
+| `GET /api/v1/state` | ✅ | ✅ | ✅ |
+| `GET /api/v1/config` | ✅ | ✅ | ✅ |
+| `POST /api/v1/config/reload` | ✅ | ✅ | ✅ |
+| `GET /api/v1/health` | ✅ | ✅ | ✅ |
+| `POST /api/v1/logging/level` | ✅ | ✅ | ✅ |
+| TCP bind address | ❌ | ✅ | ✅ |
+| Bearer token auth | ❌ | ✅ | ✅ |
+| mTLS auth | ❌ | ✅ | ✅ |
+| Rate limiting | ❌ | ✅ | ✅ |
+| Audit logging | ❌ | ✅ | ✅ |
+| `POST /api/v1/drain` | ❌ | ✅ | ✅ |
+| `POST /api/v1/processes/{name}/drain` | ❌ | ✅ | ✅ |
+| Circuit breaker reset API | ❌ | ✅ | ✅ |
+| Plugin API extensions | ❌ | ✅ | ✅ |
+| File watcher auto-reload | ❌ | ✅ | ✅ |
+| Config rollback on failure | ❌ | ✅ | ✅ |
+| Read-only mode (disable writes) | ❌ | ❌ | ✅ |
+| Role-based access control (RBAC) | ❌ | ❌ | ✅ |
+
+v1 ships with the **core operational API on Unix socket**:
+process inspection, restart, stop, start, kill, config reload,
+log level change, and state dump. All write operations are
+allowed (container is assumed secure). TCP, auth, rate
+limiting, audit logging, and plugin extensions are v1.1+.
+
+### 21.7 Why this matters
+
+Without an operational API:
+
+- To restart a process, you `docker exec kill -9` and hope
+  ezx restarts it (if configured)
+- To change log level, you restart the entire container
+- To reload config, you restart the entire pod
+- To debug, you `docker exec` and run shell commands
+
+With an operational API:
+
+- Restart a single process via `curl` without touching others
+- Change log level live without container restart
+- Reload config after editing a ConfigMap (Kubernetes) without
+  pod restart
+- Inspect full runtime state for debugging
+- Plugin vendors expose their own operational endpoints
+- CI/CD pipelines can drain traffic before deploying
+
+This is **essential for production operations**. It's what
+turns ezx from a "container tool" into a "container
+platform."
+
 ---
