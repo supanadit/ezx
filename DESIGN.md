@@ -4388,6 +4388,304 @@ ezx should be the same: **a small, fast, secure orchestrator**
 that delegates domain-specific operations to plugins that
 know their domain.
 
+### 11.16 Plugin dependencies and port management
+
+The user asks: "Does a plugin let users bring their own
+libraries (e.g., `lib/pq`, `gin`, `echo`) and does ezx manage
+ports to prevent conflicts?"
+
+#### A. Plugin dependencies: bring your own
+
+**Yes — plugins bring their own dependencies.** A plugin is a
+compiled artifact (sidecar binary or `.so`), not a source tree
+that ezx compiles. The plugin author:
+
+1. Writes their plugin in Go (or Rust, C, etc.)
+2. Imports whatever libraries they need (`lib/pq`, `gin`, `echo`,
+   `sqlx`, `gorm`, `prometheus/client_golang`, etc.)
+3. Compiles to a static binary or `.so` file
+4. Ships the compiled artifact to the user
+
+ezx does **not** manage plugin dependencies. It does **not**
+need to. Go's module system (or Rust's Cargo, or C's build
+system) handles this at plugin build time. ezx just loads the
+compiled artifact.
+
+```
+# Plugin author's workflow (not ezx's workflow)
+$ cd my-postgresql-plugin
+$ go mod init github.com/acme/pg-ha-plugin
+$ go get github.com/lib/pq                    # PostgreSQL driver
+$ go get github.com/gin-gonic/gin             # HTTP framework
+$ go build -o pg-ha-plugin ./cmd
+$ # Ship pg-ha-plugin binary to users
+```
+
+The compiled binary is **self-contained** — all dependencies
+are statically linked into the binary (for Go sidecars) or
+included in the `.so` (for Go/C/Rust `.so` plugins). The user
+doesn't install anything else.
+
+**Key consequence**: ezx core has zero dependency on what
+libraries a plugin uses. The plugin's dependencies are
+invisible to ezx. This is the same model as:
+
+- Docker images: each image has its own dependencies
+- Kubernetes operators: each operator has its own Go modules
+- Firefox extensions: each extension bundles its own libraries
+
+#### B. Port management: two models
+
+When a plugin exposes an HTTP service (e.g., a REST API for
+PostgreSQL management), there are two models:
+
+**Model 1: Shared port (plugin registers routes on ezx's API)**
+
+This is the default. The plugin registers its routes on ezx's
+operational API mux (§21.5). No separate port. No conflict.
+
+```go
+func (p *PgHAPlugin) RegisterAPI(mux APIMux) error {
+    // Routes are under ezx's /api/v1/plugins/pg-ha/ prefix
+    mux.HandleFunc("POST /api/v1/plugins/pg-ha/reconfigure", p.handleReconfigure)
+    return nil
+}
+```
+
+The user accesses the plugin via ezx's existing API:
+
+```bash
+curl http://localhost:8081/api/v1/plugins/pg-ha/reconfigure \
+  -d '{"max_connections": 200}'
+```
+
+**Model 2: Dedicated port (plugin needs its own HTTP server)**
+
+Some plugins need their own port — for example:
+
+- A Prometheus metrics exporter that needs to be scraped
+  independently (different path, different auth)
+- A plugin that serves static assets (dashboard UI)
+- A plugin that needs WebSocket support (ezx's API is HTTP/1.1)
+
+In this case, the plugin declares the port it needs, and ezx
+**allocates and validates** it:
+
+```go
+// Plugin declares its port requirement in the descriptor
+func GetDescriptor() PluginDescriptor {
+    return PluginDescriptor{
+        Name:    "prometheus-exporter",
+        Version: "1.0.0",
+        Ports: []PortRequirement{
+            {
+                Name:        "metrics",
+                Default:     9090,
+                Description: "Prometheus metrics endpoint",
+            },
+        },
+    }
+}
+```
+
+ezx's conflict detection (§13) extends to ports:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          ports:
+            - name: postgres
+              port: 5432
+      
+      - name: pgbouncer
+        process:
+          binaryPath: /usr/local/bin/pgbouncer
+          ports:
+            - name: pgbouncer
+              port: 6432
+  
+  plugins:
+    - name: prometheus-exporter
+      config:
+        # ezx validates: is 9090 free?
+        # If not, ezx assigns a dynamic port and reports it
+        metrics_port: 9090
+```
+
+At config load time, ezx validates:
+
+```go
+// conflict/service.go (extends §13)
+func (s *Service) ValidatePorts(cfg *RuntimeConfig) error {
+    used := make(map[int]string) // port -> owner
+    
+    // Check process ports
+    for _, proc := range cfg.ProcessChain.Roots {
+        for _, port := range proc.Process.Ports {
+            if owner, ok := used[port.Port]; ok {
+                return fmt.Errorf("port conflict: %d used by both %s and %s",
+                    port.Port, owner, proc.Name)
+            }
+            used[port.Port] = proc.Name
+        }
+    }
+    
+    // Check plugin ports
+    for _, plugin := range cfg.Plugins {
+        for _, port := range plugin.Ports {
+            if owner, ok := used[port.Port]; ok {
+                return fmt.Errorf("port conflict: %d used by both %s and plugin %s",
+                    port.Port, owner, plugin.Name)
+            }
+            used[port.Port] = "plugin:" + plugin.Name
+        }
+    }
+    
+    return nil
+}
+```
+
+If a conflict is detected at load time, ezx fails fast with a
+clear error:
+
+```
+✗ FATAL: port conflict at config load time
+  Port 9090 is claimed by both:
+    - process: "pgbouncer" (port: 6432... wait, 9090)
+    - plugin: "prometheus-exporter" (metrics_port: 9090)
+  Resolution: change one of the port assignments.
+```
+
+#### C. Dynamic port allocation
+
+If a plugin doesn't specify a port (or specifies `0`), ezx
+assigns a dynamic port:
+
+```go
+// Plugin descriptor: "I need a port, I don't care which"
+Ports: []PortRequirement{
+    {
+        Name:        "metrics",
+        Default:     0,  // 0 = dynamic allocation
+        Description: "Prometheus metrics endpoint",
+    },
+}
+```
+
+ezx finds an available ephemeral port (typically 1024-65535):
+
+```go
+func allocateDynamicPort() (int, error) {
+    listener, err := net.Listen("tcp", ":0")
+    if err != nil {
+        return 0, err
+    }
+    port := listener.Addr().(*net.TCPAddr).Port
+    listener.Close()
+    return port, nil
+}
+```
+
+The allocated port is reported in the plugin's config:
+
+```yaml
+runtime:
+  plugins:
+    - name: prometheus-exporter
+      config:
+        metrics_port: 49234   # dynamically assigned by ezx
+```
+
+The plugin reads its actual port from the config at runtime:
+
+```go
+func (p *PrometheusExporter) OnRuntime(ctx context.Context, req RuntimeRequest) error {
+    port := req.Config.GetInt("metrics_port")  // 49234
+    p.server = &http.Server{Addr: fmt.Sprintf(":%d", port)}
+    return p.server.ListenAndServe()
+}
+```
+
+#### D. Port collision detection
+
+Port conflicts are detected at **config validation time** (load
+time), not at runtime. This follows §13's philosophy: catch
+human error early.
+
+The four classes from §13 extend to ports:
+
+| Class | Severity | Example |
+| ------- | ---------- | --------- |
+| **Conflict** | Error (fatal) | Two plugins both claim port 9090 |
+| **Collision** | Error (fatal) | A plugin claims 5432 which is also the postgres process |
+| **Ambiguity** | Warning | Plugin declares port 0 (dynamic) but user might expect a fixed port |
+| **Undeclared** | Warning | Process opens a port not declared in its `ports:` list |
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          ports:
+            - name: postgres
+              port: 5432
+  
+  plugins:
+    - name: my-plugin
+      config:
+        # CONFLICT: 5432 is already used by postmaster
+        listen_port: 5432
+```
+
+At load time:
+
+```
+✗ CONFLICT: port 5432 claimed by multiple entities
+  - process "postmaster" (declared in processChain.roots[0].ports)
+  - plugin "my-plugin" (config.listen_port)
+  Fix: change my-plugin.config.listen_port to a different value.
+```
+
+#### E. Why ezx manages ports for plugins
+
+If ezx didn't manage ports, the user would need to:
+
+1. Manually check which ports are free in their container
+2. Assign non-conflicting ports to each plugin
+3. Hope they got it right
+
+With ezx managing ports:
+
+1. Plugin declares what it needs
+2. ezx validates at load time (catch conflicts before they happen)
+3. ezx assigns dynamic ports when needed
+4. Plugin reads its actual port from config
+5. User sees a clear error if anything conflicts
+
+This is the same model as Kubernetes Services (port allocation
+by the platform) and Docker Compose (port mapping validation).
+
+#### F. v1 scope
+
+| Feature | v1 | v1.1+ | v2.0+ |
+| --------- | ---- | ------- | ------- |
+| Plugin brings own dependencies (compiled binary/.so) | ✅ | ✅ | ✅ |
+| Shared port model (plugin routes on ezx API) | ❌ | ✅ | ✅ |
+| Dedicated port model (plugin has own port) | ❌ | ✅ | ✅ |
+| Port conflict detection at load time | ❌ | ✅ | ✅ |
+| Dynamic port allocation (port: 0) | ❌ | ✅ | ✅ |
+| Port validation in `ezx validate` | ❌ | ✅ | ✅ |
+| Undeclared port warnings | ❌ | ❌ | ✅ |
+
+v1: plugins compile their own dependencies, but ezx doesn't
+manage ports. Port management is v1.1+.
+
 ---
 
 The design's §2 "Reconciliation" section addresses env-driven
