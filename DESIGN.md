@@ -6741,4 +6741,686 @@ handles the rest. This is the same UX as:
 ezx should join this list of "package managers that handle
 transitive deps for you."
 
+## 16. Dependency isolation: multiple library versions side by side
+
+The §15 "Package management" model assumes all packages can
+share the system's library tree. In reality, this is often
+impossible:
+
+- **postgresql 16** needs **openssl 1.1**
+- **etcd 3.5** needs **openssl 3.0**
+- **A custom exporter** needs **glibc 2.35**
+- **WordPress + Apache + PHP** needs **PHP 8.3** for the site
+  but **PHP 8.2** for the exporter
+- **Patroni** needs a **Python venv** separate from system Python
+
+Two different versions of `libssl.so` cannot both live in
+`/usr/lib/x86_64-linux-gnu/`. The kernel only loads one. Two
+different PHP versions with different module trees cannot both
+live in `/usr/lib/php/`.
+
+### 16.1 Why this matters: single-container deployment
+
+In a microservices world (Kubernetes, Docker Compose), you'd
+solve this by running each program in its own container with
+its own filesystem. **But not all environments support that:**
+
+- **Google Cloud Run** runs a single container. No sidecar
+  pattern, no easy multi-container.
+- **AWS Lambda** runs a single container.
+- **Edge functions** (Cloudflare Workers, Vercel Edge) often
+  have even more restrictions.
+- **Some PaaS** (Render, Fly.io machines) restrict internal
+  networking between services.
+- **Monoliths by design**: WordPress + Apache + PHP + a custom
+  prometheus exporter are conceptually one application. Running
+  them as separate services adds operational complexity that
+  many users don't want.
+- **Demo / dev / CI images**: a single image that "just works"
+  is much easier to distribute than a docker-compose stack.
+
+The user's exact words: "hosting provider for example google
+cloud run, can run docker image directly, and setup networking
+is crazy difficult". This is a **legitimate, common, real-
+world deployment scenario** that the design must support.
+
+### 16.2 The phpv model: versioned install prefixes
+
+The phpv project solves this for PHP using a pattern that's
+been used by Linux distributions for decades: **versioned
+install prefixes** with **build-time isolation** (`LDPATH`,
+`LDFLAGS`) and **runtime isolation** (`LD_LIBRARY_PATH`).
+
+phpv's approach:
+
+1. **Each PHP version installs to its own prefix:**
+
+   ```
+   /opt/php/8.2.0/
+   │ bin/php, bin/php-fpm
+   │ lib/ (PHP modules, openssl-1.1, libxml2, etc.)
+   │ include/
+   /opt/php/8.3.0/
+   │ bin/php, bin/php-fpm
+   │ lib/ (PHP modules, openssl-3.0, libxml2, etc.)
+   │ include/
+   ```
+
+2. **Build with custom library paths:**
+
+   ```bash
+   ./configure --prefix=/opt/php-8.3.0 \
+               --with-openssl=/opt/openssl-1.1 \
+               --with-curl=/opt/curl-8.10
+   ```
+
+   The `LDFLAGS=-L/opt/openssl-1.1/lib` tells the linker where
+   to find openssl at build time. The `LD_LIBRARY_PATH=...`
+   tells the dynamic loader where to find it at runtime.
+
+3. **Shims for the active version:**
+   `~/.phpv/shims/php` is a tiny wrapper:
+
+   ```bash
+   #!/bin/sh
+   exec /opt/php-8.3.0/bin/php \
+       -d extension_dir=/opt/php-8.3.0/lib/extensions \
+       "$@"
+   ```
+
+   The shim sets the right env vars and execs the real binary.
+
+4. **Switch versions atomically:**
+   `phpv use 8.3` changes which shim is "active" by updating
+   symlinks. The user can have 8.2 and 8.3 installed side by
+   side and switch between them.
+
+### 16.3 Generalizing for ezx: any package, any version
+
+ezx generalizes the phpv pattern to **any package**, not just
+PHP. The key insight is that the same approach works for
+**any program that needs its own library tree**:
+
+- **C/C++ programs** built against specific library versions
+  (postgresql, etcd, redis, nginx)
+- **Python programs** in their own venv (patroni, ansible)
+- **Node.js programs** with their own node_modules (custom
+  exporters, sidecar agents)
+- **Go programs** that need a specific glibc version
+- **Any program** that conflicts with another program in the
+  same image
+
+ezx's `setup.packages[]` model gets a new `isolated: true`
+field:
+
+```yaml
+setup:
+  packages:
+    - name: postgresql
+      version: "16.4"
+      isolated: true          # NEW: install to /opt/postgresql-16.4/
+    
+    - name: etcd
+      version: "3.5"
+      isolated: true          # NEW: install to /opt/etcd-3.5/
+      # This conflicts with postgresql's openssl 1.1
+      # but isolation resolves it
+    
+    - name: patroni
+      version: "4.1"
+      isolated: true          # NEW: install to /opt/patroni-4.1/ (Python venv)
+```
+
+### 16.4 How isolation works
+
+When `isolated: true` is set, ezx:
+
+1. **Installs the package to a versioned prefix:**
+
+   ```
+   /opt/<name>/<version>/
+   ├── bin/         # executables
+   ├── lib/         # shared libraries
+   ├── include/     # headers
+   ├── share/       # data files
+   └── ...
+   ```
+
+2. **Installs the package's dependencies to their own
+   versioned prefixes (when they conflict):**
+
+   ```
+   /opt/openssl-1.1/     # for postgresql
+   /opt/openssl-3.0/     # for etcd
+   /opt/readline-8.2/    # for postgresql (only)
+   /opt/zlib-1.2/        # shared
+   ```
+
+3. **Builds the package with explicit library paths:**
+
+   ```bash
+   ./configure \
+       --prefix=/opt/postgresql-16.4 \
+       --with-openssl=/opt/openssl-1.1 \
+       --with-readline=/opt/readline-8.2 \
+       --with-zlib=/opt/zlib-1.2
+   ```
+
+   The package's binaries are **statically linked** to the
+   right library versions (via rpath or runpath).
+
+4. **Generates a wrapper shim in `/usr/local/bin/`:**
+
+   ```bash
+   #!/bin/sh
+   # /usr/local/bin/postgresql (auto-generated by ezx)
+   export LD_LIBRARY_PATH=/opt/openssl-1.1/lib:/opt/readline-8.2/lib:/opt/zlib-1.2/lib:${LD_LIBRARY_PATH}
+   exec /opt/postgresql-16.4/bin/postgres "$@"
+   ```
+
+5. **Updates the runtime config to use the shim:**
+
+   ```yaml
+   runtime:
+     processChain:
+       roots:
+         - name: postgresql
+           process:
+             binaryPath: /usr/local/bin/postgresql    # the shim
+             arguments: ["-D", "{{ .Env.PGDATA }}"]
+   ```
+
+The shim is **tiny** (a few shell lines) and sets the right
+env vars before exec. The real binary lives in the versioned
+prefix and is never in `PATH` directly.
+
+### 16.5 The user's exact use cases, solved
+
+#### Case 1: Google Cloud Run / single-container deployment
+
+User runs the entire stack in one image. Networking is hard
+or impossible between services. The image must be self-
+contained.
+
+```yaml
+setup:
+  packages:
+    # postgresql needs openssl 1.1
+    - name: postgresql
+      version: "16.4"
+      isolated: true
+    
+    # etcd needs openssl 3.0 (conflicts with postgresql)
+    - name: etcd
+      version: "3.5"
+      isolated: true
+    
+    # patroni is a Python app, needs its own venv
+    - name: patroni
+      version: "4.1"
+      isolated: true
+      # Python deps: python 3.11, requests, psycopg, etcd3
+    
+    # pgbouncer can use system openssl (no conflict)
+    - name: pgbouncer
+      version: "1.23.1"
+      # isolated: false (default) → installs to /usr/local/
+```
+
+ezx's resolver:
+
+1. Sees postgresql needs openssl >= 1.1
+2. Sees etcd needs openssl >= 3.0
+3. **Installs two versions of openssl:**
+   - `/opt/openssl-1.1/` (for postgresql)
+   - `/opt/openssl-3.0/` (for etcd)
+4. Builds postgresql against openssl 1.1
+5. Builds etcd against openssl 3.0
+6. Builds patroni as a Python venv
+7. Installs pgbouncer normally (no isolation)
+8. Generates shims in `/usr/local/bin/`:
+   - `postgresql` → `/opt/postgresql-16.4/bin/postgres` (with openssl 1.1)
+   - `etcd` → `/opt/etcd-3.5/bin/etcd` (with openssl 3.0)
+   - `patroni` → `/opt/patroni-4.1/bin/patroni` (with Python venv)
+   - `pgbouncer` → `/usr/local/bin/pgbouncer` (system openssl)
+
+The final image has **two versions of openssl** side by side,
+each used by the right program. No conflict. No need for
+multiple containers. Works on Cloud Run.
+
+#### Case 2: WordPress + Apache + PHP + exporter
+
+The WordPress site uses PHP 8.3. The prometheus exporter
+(also a PHP app) uses PHP 8.2 because of a specific module.
+
+```yaml
+setup:
+  packages:
+    - name: apache
+      version: "2.4.62"
+      isolated: true          # needs specific openssl, apr
+    
+    - name: php-83
+      version: "8.3"
+      isolated: true          # WordPress's PHP
+      # provides: php, php-fpm
+      # needs: openssl 3.0, libxml2, libcurl
+    
+    - name: php-82
+      version: "8.2"
+      isolated: true          # exporter's PHP
+      # provides: php82, php82-fpm
+      # needs: openssl 3.0 (same as 8.3, so can share)
+      # different module set
+    
+    - name: wordpress-exporter
+      version: "1.0"
+      # The exporter is a PHP app that uses php-82
+      # It's installed to /opt/wordpress-exporter/
+      # Its shebang: #!/opt/php-82/bin/php
+```
+
+ezx installs:
+
+- `/opt/apache-2.4.62/` (linked against /opt/openssl-3.0/)
+- `/opt/php-8.3/` (linked against /opt/openssl-3.0/)
+- `/opt/php-8.2/` (linked against /opt/openssl-3.0/, different modules)
+- `/opt/wordpress-exporter/` (uses /opt/php-8.2/bin/php)
+
+Two PHP versions coexist. The WordPress site uses 8.3. The
+exporter uses 8.2. No conflict.
+
+#### Case 3: HA PostgreSQL with Patroni
+
+The classic HA setup. Patroni is a Python app that manages
+postgres replication, but it needs a consensus backend
+(etcd, zookeeper, or redis). All in one image, no networking
+between containers.
+
+```yaml
+setup:
+  packages:
+    - name: postgresql
+      version: "16.4"
+      isolated: true
+    
+    - name: etcd
+      version: "3.5"
+      isolated: true          # consensus backend
+    
+    - name: patroni
+      version: "4.1"
+      isolated: true          # Python app
+      # talks to localhost:5432 (postgres) and localhost:2379 (etcd)
+```
+
+All three run in the same container, talk to each other over
+localhost. Each uses its own library tree. No conflicts.
+
+### 16.6 The resolver's role
+
+The §15 resolver extends to handle the isolation case:
+
+```go
+type PackageRequest struct {
+    Name      string
+    Version   string
+    Source    string            // auto | apt | build | system
+    Isolated  bool              // NEW: install to versioned prefix
+}
+
+type BuildPlan struct {
+    Steps []BuildStep
+}
+
+type BuildStep struct {
+    Name           string
+    Type           StepType
+    Package        string
+    Version        string
+    InstallPrefix  string         // NEW: /opt/<name>-<version> if isolated
+    DependsOn      []string
+    LibPaths       []string       // NEW: for LD_LIBRARY_PATH
+    ShimScript     string         // NEW: path to generated shim
+    // ... existing fields
+}
+```
+
+The resolver:
+
+1. Walks the dependency graph
+2. For each dep, checks if it's shared (one version works for
+   everyone) or conflicting (different versions needed)
+3. **Installs one version for shared deps, multiple versions
+   for conflicting deps**
+4. Records the install prefix and lib path for each package
+5. Generates shims for isolated packages
+
+The dependency graph gets a new concept: **version edges**.
+Two packages can both depend on `openssl` but require
+different versions. The resolver tracks this:
+
+```
+postgresql 16.4 → openssl 1.1 (version edge)
+etcd 3.5      → openssl 3.0 (version edge)
+
+Resolver sees: two different openssl versions needed
+Resolution: install both
+  /opt/openssl-1.1/  (for postgresql)
+  /opt/openssl-3.0/  (for etcd)
+```
+
+### 16.7 The shim generation
+
+For each isolated package, ezx generates a wrapper script:
+
+```go
+// setup/shim.go
+type ShimSpec struct {
+    ShimName     string    // e.g., "postgresql"
+    RealBinary   string    // e.g., "/opt/postgresql-16.4/bin/postgres"
+    LibPaths     []string  // e.g., ["/opt/openssl-1.1/lib", ...]
+    PathPrepend  []string  // e.g., ["/opt/postgresql-16.4/bin"]
+    EnvVars      []string  // additional env vars
+}
+
+func GenerateShim(spec ShimSpec) (string, error) {
+    template := `#!/bin/sh
+# Auto-generated by ezx — do not edit
+export LD_LIBRARY_PATH={{.LibPaths}}:${LD_LIBRARY_PATH}
+export PATH={{.PathPrepend}}:${PATH}
+{{- range .EnvVars}}
+export {{.}}
+{{- end}}
+exec {{.RealBinary}} "$@"
+`
+    // ... render and write to /usr/local/bin/<shim_name>
+}
+```
+
+The shim is **executable** (chmod 755), **owned by root**,
+and is the entry point that the runtime orchestrator calls.
+
+The runtime YAML references the shim:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postgresql
+        process:
+          binaryPath: /usr/local/bin/postgresql    # the shim
+          arguments: ["-D", "{{ .Env.PGDATA }}"]
+          # environment: [...]                     # additional env if needed
+```
+
+The user never references `/opt/postgresql-16.4/bin/postgres`
+directly. They use the shim, which abstracts the install
+location.
+
+### 16.8 rpath vs LD_LIBRARY_PATH
+
+There are two ways to make a binary find its libraries:
+
+1. **`LD_LIBRARY_PATH`**: set at runtime, looked up first by
+   the dynamic linker. Easy to set, easy to override.
+2. **rpath / runpath**: embedded in the binary at link time.
+   The binary itself knows where its libs are.
+
+The shim approach uses `LD_LIBRARY_PATH` because:
+
+- It's simple and explicit
+- It works for all binaries (including Python, Node, Go)
+- It doesn't require modifying the binary at link time
+- It's easy to debug (just `echo $LD_LIBRARY_PATH`)
+
+The build-time approach (during setup) uses rpath as a backup:
+
+- The binary is built with `LDFLAGS="-Wl,-rpath=/opt/openssl-1.1/lib"`
+- This means the binary can find its libs even without
+  `LD_LIBRARY_PATH` set
+- The shim sets `LD_LIBRARY_PATH` for clarity, but rpath is
+  the actual mechanism
+
+For maximum reliability, ezx uses **both**:
+
+- The binary is built with rpath pointing to its versioned
+  lib directory
+- The shim sets `LD_LIBRARY_PATH` for additional safety
+
+This way, if the user runs the binary directly (without the
+shim), it still finds its libs.
+
+### 16.9 The cleanup step
+
+The cleanup step in §15.6 (automatic compiler stripping) is
+extended for isolated packages:
+
+```yaml
+# Auto-generated by assembler
+- name: cleanup
+  type: cleanup
+  removes:
+    - build-essential            # the compiler
+    - libssl-dev                 # dev headers (NOT the runtime libs)
+    - libreadline-dev
+    - zlib1g-dev
+    - libevent-dev
+  keeps:
+    # Isolated packages stay in the final image
+    - /opt/postgresql-16.4
+    - /opt/etcd-3.5
+    - /opt/patroni-4.1
+    - /opt/openssl-1.1           # needed by postgresql
+    - /opt/openssl-3.0           # needed by etcd
+    # Shared packages can be either kept or removed
+    - libssl3                    # if no isolated package needs it
+    - libreadline8
+```
+
+The user can override:
+
+```yaml
+setup:
+  packages:
+    - name: postgresql
+      version: "16.4"
+      isolated: true
+      # Default: keep /opt/postgresql-16.4 in final image
+      # Override: remove after use (won't work, postgres runs at runtime)
+      # Actually: isolated=true means the package is kept
+```
+
+For isolated packages, the cleanup **never removes the
+package itself** (it's needed at runtime). It only removes
+the build-time artifacts (sources, build dirs, compilers).
+
+### 16.10 `/etc/ld.so.conf.d/` integration (v1.2+)
+
+In addition to the shim approach, ezx can write to
+`/etc/ld.so.conf.d/ezx-*.conf` and run `ldconfig`. This is
+the "Linux native" way to add library search paths.
+
+```bash
+# /etc/ld.so.conf.d/ezx-openssl-1.1.conf
+/opt/openssl-1.1/lib
+
+# /etc/ld.so.conf.d/ezx-openssl-3.0.conf
+/opt/openssl-3.0/lib
+```
+
+After writing these, run `ldconfig` to update the cache. Now
+**any** binary (not just the shimmed ones) can find these
+libs.
+
+This is more invasive (touches system config) but more
+"Linux native". It's a v1.2+ feature; v1.1 uses the shim
+approach only.
+
+### 16.11 The marketplace and isolation
+
+A vendor shipping an isolated package as a plugin:
+
+```yaml
+# Plugin: postgresql-ha
+apiVersion: ezx/v1
+kind: Plugin
+metadata:
+  name: postgresql-ha
+  version: 1.0.0
+spec:
+  type: sidecar
+  # The plugin ships pre-built binaries for:
+  #   - postgresql 16.4 (isolated)
+  #   - etcd 3.5 (isolated)
+  #   - patroni 4.1 (isolated)
+  # User just installs the plugin and runs it
+```
+
+The plugin's `OnSetup` hook extracts the pre-built binaries
+to `/opt/postgresql-16.4/`, `/opt/etcd-3.5/`, etc. The
+runtime orchestrator uses the shims in `/usr/local/bin/`.
+
+This is the **same pattern as Docker images** but with
+isolation. A user can download a "postgresql HA plugin" and
+get a working HA setup without compiling anything.
+
+### 16.12 Integration with existing design
+
+This extends several existing sections:
+
+1. **§4.6 (Sources)**: the `source:` field gets a new
+   `install_prefix` field for isolated installs
+2. **§15 (Package management)**: the `setup.packages[]` model
+   gets a new `isolated: true` field
+3. **§15.3 (Resolver)**: handles conflicting version edges
+4. **§15.6 (Cleanup)**: knows not to remove isolated packages
+5. **§3 (Clean architecture)**: the runtime orchestrator
+   doesn't change — `binaryPath` already supports a shim
+6. **§11.5 (Plugins)**: plugins can ship pre-built isolated
+   packages
+
+The runtime orchestrator doesn't need to change. The
+`Process.BinaryPath` field already supports any path, and the
+`Process.Environment` field already supports per-process env
+vars. The shim is just a static script that the setup phase
+generates.
+
+### 16.13 What about Python venvs?
+
+For Python packages (like Patroni), isolation is done via
+**virtual environments**:
+
+```bash
+# Create a venv
+python3 -m venv /opt/patroni-4.1
+
+# Install dependencies
+/opt/patroni-4.1/bin/pip install patroni[etcd] psycopg2-binary
+
+# The patroni binary is at /opt/patroni-4.1/bin/patroni
+# It uses /opt/patroni-4.1/lib/python3.11/site-packages/
+```
+
+The shim for patroni:
+
+```bash
+#!/bin/sh
+# /usr/local/bin/patroni (auto-generated)
+export PATH=/opt/patroni-4.1/bin:$PATH
+export VIRTUAL_ENV=/opt/patroni-4.1
+exec /opt/patroni-4.1/bin/patroni "$@"
+```
+
+This is the **standard Python venv pattern** wrapped in an
+ezx-managed shim. The user gets the isolation benefits of
+venvs with the convenience of ezx's package management.
+
+### 16.14 v1 scope
+
+| Feature | v1 | v1.1+ |
+| --------- | --- | ------ |
+| `setup.steps[]` (low-level) | ✅ | ✅ |
+| `setup.packages[]` (high-level) | ❌ | ✅ |
+| Isolated installs (`isolated: true`) | ❌ | ✅ |
+| Versioned install prefixes (`/opt/<name>-<version>/`) | ❌ | ✅ |
+| Multiple versions of the same lib | ❌ | ✅ |
+| Shim generation (`/usr/local/bin/<name>`) | ❌ | ✅ |
+| Build-time isolation (`LDFLAGS`, `LDPATH`) | ❌ | ✅ |
+| Runtime isolation (`LD_LIBRARY_PATH`) | ❌ | ✅ |
+| rpath in built binaries | ❌ | ✅ |
+| Python venv isolation | ❌ | ✅ |
+| Plugin-shipped pre-built isolated packages | ❌ | ✅ |
+| `/etc/ld.so.conf.d/` integration | ❌ | v1.2 |
+| `ezx setup plan --show-isolation` | ❌ | ✅ |
+
+v1 ships with the **low-level `setup.steps[]`** only. The
+high-level `setup.packages[]` with isolation is a **v1.1+
+feature**.
+
+This is consistent with the v1 philosophy: **v1 is the
+smallest possible thing that solves the original problem**
+(basic postgresql sandbox, single version, no isolation). The
+isolation model is a major feature that requires:
+
+- Resolver changes (handling version edges)
+- Shim generation
+- Build-time isolation (LDPATH/LDFLAGS)
+- rpath support
+- Python venv support
+- Testing across conflicting versions
+
+All of this is substantial work. v1.1 is the right milestone.
+
+### 16.15 Why this matters
+
+The user's concern is **the defining use case for ezx as a
+product**. ezx is designed to replace bash scripts in
+container images. Those images are deployed to **single-
+container environments** (Cloud Run, Lambda, monoliths, edge).
+In those environments, **dependency isolation is the only way
+to make the image work**.
+
+Without isolation:
+
+- You're stuck with whatever apt provides
+- You can't use a custom curl version
+- You can't have postgresql + etcd in the same image (openssl
+  conflict)
+- You can't have WordPress + exporter with different PHP
+  versions
+
+With isolation:
+
+- You can use any version of any library
+- Conflicting programs coexist
+- Single-container deployment works for any stack
+- The user has the same flexibility as a multi-container
+  deployment, but with the simplicity of one image
+
+This is **the difference between ezx being a nice-to-have
+and ezx being essential**. A user running on Cloud Run with
+postgresql + patroni + etcd **needs** this feature. Without
+it, they go back to bash.
+
+### 16.16 The phpv parallel
+
+The user referenced phpv's LDPATH/LDFLAGS support. This is
+exactly the same pattern, generalized:
+
+| phpv | ezx |
+| ------ | ----- |
+| PHP versions | Any package |
+| `/opt/php/<version>/` | `/opt/<name>/<version>/` |
+| `LDPATH`, `LDFLAGS` | Build-time isolation |
+| `LD_LIBRARY_PATH` | Runtime isolation (shim) |
+| Shims in `~/.phpv/shims/` | Shims in `/usr/local/bin/` |
+| `phpv use 8.3` | (not needed — shim picks the right one) |
+| Multiple PHP versions | Multiple versions of any package |
+
+Anyone familiar with phpv will recognize the pattern. The
+extension is: ezx does this for **any package**, not just
+PHP, and **automates the resolver and shim generation** that
+phpv does manually.
+
 ---
