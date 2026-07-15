@@ -4236,13 +4236,159 @@ ezx plugin schema redis-middleware  # dumps the plugin's schema fragment
 | `ezx explain` subcommand | ❌ | ✅ |
 | `ezx plugin schema <name>` subcommand | ❌ | ✅ |
 
-v1 ships with **90% of the schema extension use cases** —
+v1 ships with **90% of the schema extension use cases** -
 plugins can add their own top-level keys and extend the
 existing `Bootstrapper` kind. The remaining 10% (new `kind:`
 values, multi-resource YAML) is a v1.1+ feature that requires
 its own design pass.
 
-## 12. File rendering reconciliation
+### 11.15 Plugins extend runtime capabilities ezx core doesn't provide
+
+A critical design principle: **ezx core is intentionally
+limited.** It orchestrates processes, renders files, forwards
+signals, and exposes metrics. It does **not** attempt to be
+the universal runtime controller for every technology.
+
+This is where plugins shine. A plugin can add capabilities
+that ezx core deliberately omits.
+
+#### Example: runtime PostgreSQL reconfiguration
+
+ezx core **does not** support changing env vars at runtime
+(§22.10 notes live env updates are v1.1+). But a PostgreSQL
+HA plugin can add its own REST API endpoint that reconfigures
+PostgreSQL **without touching env vars at all**:
+
+```go
+func (p *PgHAPlugin) RegisterAPI(mux APIMux) error {
+    // POST /api/v1/plugins/pg-ha/reconfigure
+    // Body: {"max_connections": 200, "shared_buffers": "4GB"}
+    mux.HandleFunc("POST /api/v1/plugins/pg-ha/reconfigure", p.handleReconfigure)
+    
+    // POST /api/v1/plugins/pg-ha/failover
+    // Body: {"target": "replica-2"}
+    mux.HandleFunc("POST /api/v1/plugins/pg-ha/failover", p.handleFailover)
+    
+    // GET /api/v1/plugins/pg-ha/replication-status
+    mux.HandleFunc("GET /api/v1/plugins/pg-ha/replication-status", p.handleReplicationStatus)
+    
+    return nil
+}
+
+func (p *PgHAPlugin) handleReconfigure(ctx context.Context, req APIRequest) APIResponse {
+    var cfg PgConfig
+    if err := json.Unmarshal(req.Body, &cfg); err != nil {
+        return APIResponse{Status: 400, Body: []byte("invalid JSON")}
+    }
+    
+    // Connect to PostgreSQL via Unix socket
+    db, err := sql.Open("postgres", "host=/var/run/postgresql user=postgres")
+    if err != nil {
+        return APIResponse{Status: 500, Body: []byte("can't connect")}
+    }
+    defer db.Close()
+    
+    // Use ALTER SYSTEM to change settings (no restart needed for many)
+    _, err = db.ExecContext(ctx, fmt.Sprintf("ALTER SYSTEM SET max_connections = %d", cfg.MaxConnections))
+    if err != nil {
+        return APIResponse{Status: 500, Body: []byte(err.Error())}
+    }
+    
+    // Reload configuration (no restart)
+    _, err = db.ExecContext(ctx, "SELECT pg_reload_conf()")
+    if err != nil {
+        return APIResponse{Status: 500, Body: []byte(err.Error())}
+    }
+    
+    return APIResponse{Status: 200, Body: []byte(`{"status":"ok","reloaded":true}`)}
+}
+```
+
+The plugin:
+
+1. Accepts a reconfiguration request via its own API endpoint
+2. Connects to PostgreSQL directly (Unix socket, same container)
+3. Uses `ALTER SYSTEM` to change PostgreSQL settings
+4. Calls `pg_reload_conf()` to apply changes without restart
+5. Returns the result to the caller
+
+ezx core never needs to know how PostgreSQL reconfiguration
+works. The plugin handles it entirely. This is the **Unix
+philosophy**: do one thing well, compose tools that do other
+things well.
+
+#### Example: Redis cluster resharding
+
+A Redis plugin can add an endpoint that triggers resharding:
+
+```go
+func (p *RedisPlugin) RegisterAPI(mux APIMux) error {
+    mux.HandleFunc("POST /api/v1/plugins/redis/reshard", p.handleReshard)
+    mux.HandleFunc("POST /api/v1/plugins/redis/failover", p.handleFailover)
+    return nil
+}
+```
+
+The plugin talks to Redis nodes via the Redis protocol,
+executes `CLUSTER RESHARD`, and reports progress back through
+the API.
+
+#### Example: custom secrets rotation
+
+A Vault plugin can add an endpoint that rotates database
+credentials without restarting anything:
+
+```go
+func (p *VaultPlugin) RegisterAPI(mux APIMux) error {
+    mux.HandleFunc("POST /api/v1/plugins/vault/rotate-db-credentials", p.handleRotate)
+    return nil
+}
+
+func (p *VaultPlugin) handleRotate(ctx context.Context, req APIRequest) APIResponse {
+    // 1. Ask Vault for new credentials
+    newCreds, err := p.vaultClient.GenerateCredentials("postgresql")
+    
+    // 2. Update PostgreSQL's user (CREATE USER, GRANT)
+    db, _ := sql.Open("postgres", p.currentAdminDSN)
+    db.ExecContext(ctx, fmt.Sprintf("ALTER USER app WITH PASSWORD '%s'", newCreds.Password))
+    
+    // 3. Update the application's connection pool (SIGHUP or API call)
+    p.notifyApplicationToReconnect()
+    
+    // 4. Revoke old credentials in Vault
+    p.vaultClient.Revoke(oldCreds.LeaseID)
+    
+    return APIResponse{Status: 200, Body: []byte(`{"rotated":true}`)}
+}
+```
+
+#### Why this matters
+
+Without the plugin model, ezx would need to:
+
+- Know PostgreSQL's `ALTER SYSTEM` syntax
+- Know Redis's `CLUSTER RESHARD` protocol
+- Know Vault's credential rotation API
+- Know every technology's operational surface
+
+With the plugin model:
+
+- ezx core stays small (process orchestration only)
+- Domain experts write plugins for their technologies
+- Users compose plugins for their specific stack
+- The ecosystem grows without bloating the core
+
+This is the same principle that makes Kubernetes extensible:
+
+- Kubernetes doesn't know how to provision AWS EBS volumes
+- The AWS EBS CSI plugin does
+- Kubernetes just calls the plugin's interface
+
+ezx should be the same: **a small, fast, secure orchestrator**
+that delegates domain-specific operations to plugins that
+know their domain.
+
+---
 
 The design's §2 "Reconciliation" section addresses env-driven
 state for the **database** (passwords, settings, roles). But the
@@ -9493,6 +9639,7 @@ Final env = Layer 1 ∪ Layer 2 ∪ Layer 3
 ```
 
 This is the same model as Docker Compose (global `environment:`
+
 - per-service `environment:`) and Kubernetes (Pod env +
 container env).
 
