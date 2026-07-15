@@ -7423,4 +7423,360 @@ extension is: ezx does this for **any package**, not just
 PHP, and **automates the resolver and shim generation** that
 phpv does manually.
 
+## 17. Telemetry: Prometheus metrics and observability
+
+Any modern container runtime is expected to expose **observability**
+signals. ezx provides built-in **Prometheus-compatible metrics** via an
+HTTP endpoint that a Prometheus server (or compatible scraper) polls
+periodically. Plugins can register custom metrics. The metrics system
+is opt-out (always on) but the endpoint is opt-in (bind address
+configurable).
+
+### 17.1 Why Prometheus
+
+Prometheus is the **de facto standard** for metrics in container and
+Kubernetes environments:
+
+- Simple text-based exposition format (no protobuf required)
+- HTTP pull model (no need to configure a push destination)
+- Native integration with Grafana, Alertmanager, Datadog, New Relic
+- Well-understood by SREs and platform teams
+
+OpenTelemetry is the future, but Prometheus is the present. ezx
+exposes **Prometheus exposition format** first; OTel can be added
+as a translation layer later.
+
+### 17.2 Built-in metrics
+
+ezx exposes three categories of built-in metrics:
+
+#### A. Process metrics (per managed process)
+
+| Metric | Type | Description | Labels |
+| -------- | ------ | ------------- | -------- |
+| `ezx_process_up` | gauge | 1 = running, 0 = not running | `name`, `binary` |
+| `ezx_process_restarts_total` | counter | Number of times ezx restarted this process | `name`, `binary`, `reason` |
+| `ezx_process_start_time_seconds` | gauge | Unix timestamp of last start | `name` |
+| `ezx_process_exit_code` | gauge | Last exit code (0 = clean, >0 = error, -1 = killed) | `name`, `signal` |
+| `ezx_process_memory_rss_bytes` | gauge | Resident set size from /proc/<pid>/statm | `name` |
+| `ezx_process_cpu_seconds_total` | counter | CPU time (user+sys) from /proc/<pid>/stat | `name` |
+| `ezx_process_uptime_seconds` | gauge | Seconds since last start | `name` |
+
+Example output:
+
+```
+# HELP ezx_process_up Whether the process is currently running
+# TYPE ezx_process_up gauge
+ezx_process_up{name="postmaster",binary="postgres"} 1
+ezx_process_up{name="pgbouncer",binary="pgbouncer"} 1
+ezx_process_up{name="patroni",binary="python"} 0
+
+# HELP ezx_process_restarts_total Total number of restarts
+# TYPE ezx_process_restarts_total counter
+ezx_process_restarts_total{name="patroni",binary="python",reason="exit_code_1"} 3
+```
+
+#### B. File rendering metrics (per rendered file)
+
+| Metric | Type | Description | Labels |
+| -------- | ------ | ------------- | -------- |
+| `ezx_file_rendered` | gauge | 1 = file matches env, 0 = drift detected | `file`, `mode` |
+| `ezx_file_render_time_seconds` | gauge | Unix timestamp of last render | `file` |
+| `ezx_file_reconcile_drift_total` | counter | Number of times drift was detected | `file`, `mode` |
+| `ezx_file_reconcile_errors_total` | counter | Number of reconciliation errors | `file`, `error` |
+
+#### C. System / ezx self-metrics
+
+| Metric | Type | Description | Labels |
+| -------- | ------ | ------------- | -------- |
+| `ezx_build_info` | gauge | 1, with version metadata | `version`, `commit`, `go_version`, `os`, `arch` |
+| `ezx_uptime_seconds` | gauge | Seconds since ezx started | — |
+| `ezx_config_valid` | gauge | 1 = config loaded OK, 0 = error | `config_path` |
+| `ezx_config_last_load_time_seconds` | gauge | Last config load timestamp | `config_path` |
+| `ezx_plugins_loaded` | gauge | Number of currently loaded plugins | — |
+| `ezx_plugins_total` | gauge | Total plugins discovered | — |
+
+### 17.3 Metric collection architecture
+
+```
+ezx/
+├── telemetry/                      # NEW use case
+│   ├── service.go                    # metric registry, HTTP server
+│   ├── collector.go                  # built-in collectors
+│   ├── registry.go                   # plugin metric registration
+│   ├── exporter.go                   # Prometheus text format encoder
+│   ├── security.go                   # auth, TLS, allowlist
+│   └── types.go                      # Metric, Gauge, Counter, Histogram
+├── internal/
+│   └── repository/
+│       └── system/
+│           ├── proc.go               # read /proc/<pid>/* for metrics
+│           └── cgroup.go             # read cgroup stats for container metrics
+```
+
+The `telemetry/` package:
+
+- Maintains an in-memory registry of all metrics
+- Runs collectors on a ticker (every 15s by default)
+- Serves `/metrics` on an HTTP endpoint
+- Formats output in Prometheus exposition format
+
+### 17.4 The HTTP endpoint
+
+```yaml
+# ezx.setup.yaml (or ezx.runtime.yaml)
+telemetry:
+  enabled: true                    # default: true
+  bind_address: ":8080"            # default: ":8080"
+  # For Unix socket (more secure, no TCP port exposed):
+  # bind_address: "unix:///var/run/ezx/metrics.sock"
+  path: "/metrics"                 # default: "/metrics"
+  interval: "15s"                  # collection interval
+  # Security (v1.1+):
+  # tls:
+  #   cert_file: /etc/ezx/tls/metrics.crt
+  #   key_file: /etc/ezx/tls/metrics.key
+  # auth:
+  #   bearer_token_file: /etc/ezx/metrics-token
+  # allowlist:
+  #   - "10.0.0.0/8"
+  #   - "127.0.0.1/32"
+```
+
+The endpoint is **opt-out** (`enabled: true` by default) but the
+**bind address** is opt-in. If the user doesn't configure it, ezx
+creates a Unix socket at `/var/run/ezx/metrics.sock` (secure by
+default — only accessible from within the container).
+
+For Prometheus scraping from outside the container, the user
+binds to a TCP port:
+
+```yaml
+telemetry:
+  bind_address: ":9090"
+```
+
+For sidecar scrapers (within the same pod), a Unix socket is
+sufficient and more secure:
+
+```yaml
+telemetry:
+  bind_address: "unix:///tmp/ezx-metrics.sock"
+```
+
+### 17.5 Plugin custom metrics
+
+Plugins register custom metrics via the `Extension` interface:
+
+```go
+// domain/plugin.go
+type Extension interface {
+    Name() string
+    Version() string
+    OnSetup(ctx context.Context, req SetupRequest) error
+    OnRuntime(ctx context.Context, req RuntimeRequest) error
+    OnShutdown(ctx context.Context) error
+    SchemaExtensions() []SchemaExtension
+
+    // NEW: register custom metrics
+    RegisterMetrics(reg TelemetryRegistry) error
+}
+
+type TelemetryRegistry interface {
+    RegisterGauge(name, help string, labels ...string) Gauge
+    RegisterCounter(name, help string, labels ...string) Counter
+    RegisterHistogram(name, help string, buckets []float64, labels ...string) Histogram
+}
+```
+
+Example plugin registering a custom metric:
+
+```go
+func (p *MyPlugin) RegisterMetrics(reg TelemetryRegistry) error {
+    p.requestsTotal = reg.RegisterCounter(
+        "myplugin_requests_total",
+        "Total requests handled by myplugin",
+        "method", "status",
+    )
+    p.requestDuration = reg.RegisterHistogram(
+        "myplugin_request_duration_seconds",
+        "Request duration in seconds",
+        prometheus.DefBuckets,
+        "method",
+    )
+    return nil
+}
+```
+
+The plugin then updates metrics at runtime:
+
+```go
+func (p *MyPlugin) OnRuntime(ctx context.Context, req RuntimeRequest) error {
+    // ... handle request ...
+    p.requestsTotal.With("method", "GET", "status", "200").Inc()
+    p.requestDuration.With("method", "GET").Observe(0.023)
+    return nil
+}
+```
+
+The telemetry service collects all registered metrics on each
+collection interval and exposes them via `/metrics`.
+
+### 17.6 Security: what metrics leak
+
+Metrics can leak sensitive information:
+
+| Risk | Example | Mitigation |
+| ------ | --------- | ------------ |
+| File paths | `ezx_file_rendered{file="/etc/postgresql/16/main/pg_hba.conf"}` | File paths are relative to `{{ .Env.PGDATA }}` |
+| Env var names | `ezx_file_rendered{file="..."}` doesn't show values | Values are never exposed (§14.8 secrets) |
+| Plugin names | `ezx_plugin_loaded` with plugin name | Plugin names are public (vendor identifier) |
+| Process names | `ezx_process_up{name="postmaster"}` | Process names are from config (user-controlled) |
+| Exit codes | `ezx_process_exit_code{name="patroni",signal="SIGKILL"}` | Can reveal OOM kills (useful for debugging) |
+
+Mitigations built into ezx:
+
+1. **Never expose secrets**: metric labels never include env var values
+2. **Never expose credentials**: metric labels never include passwords, tokens
+3. **Path sanitization**: absolute paths are relative-ized to `{{ .Env.PGDATA }}`
+4. **Opt-out**: user can disable metrics entirely with `enabled: false`
+5. **Bind to localhost by default**: TCP port only exposed if user explicitly configures it
+6. **Unix socket default**: no TCP port open by default
+
+Additional security controls (v1.1+):
+
+- TLS on the metrics endpoint
+- Bearer token auth
+- IP allowlist
+- Metric label allowlist (only expose specific labels)
+
+### 17.7 Push model (v1.2+)
+
+Some environments don't support pull scraping (serverless,
+ephemeral containers, batch jobs). ezx supports **push** to a
+Pushgateway or remote-write endpoint:
+
+```yaml
+telemetry:
+  mode: push                     # default: pull
+  push:
+    endpoint: "http://pushgateway:9091"
+    job: "ezx-postgresql"
+    interval: "30s"
+    # Or remote-write (v1.2+):
+    # remote_write:
+    #   endpoint: "https://prometheus/api/v1/write"
+    #   tls_config:
+    #     cert_file: /etc/ezx/tls/client.crt
+```
+
+Push mode is **v1.2+** because it's less common and requires
+more configuration.
+
+### 17.8 Health endpoint
+
+In addition to `/metrics`, ezx exposes a **health endpoint** for
+load balancers and orchestrators:
+
+```yaml
+telemetry:
+  health_path: "/health"         # default: "/health"
+```
+
+Response:
+
+```json
+{
+  "status": "healthy",
+  "checks": {
+    "config": {"status": "pass"},
+    "processes": {
+      "status": "pass",
+      "postmaster": {"up": true, "pid": 42},
+      "pgbouncer": {"up": true, "pid": 43}
+    },
+    "files": {"status": "pass", "drift_count": 0},
+    "plugins": {"status": "pass", "loaded": 2}
+  }
+}
+```
+
+The health endpoint returns:
+
+- `200 OK` when all critical checks pass
+- `503 Service Unavailable` when any critical check fails
+- Used by Kubernetes liveness/readiness probes, Cloud Run health checks
+
+### 17.9 Integration with existing design
+
+| Section | Integration |
+| --------- | ------------- |
+| §11 (Plugin system) | Plugins register custom metrics via `RegisterMetrics()` |
+| §12 (File rendering) | Reconciliation metrics exposed as `ezx_file_*` |
+| §14 (Security) | Metrics security controls (no secrets, auth, TLS) |
+| §15 (Package mgmt) | Build metrics not exposed at runtime (different lifecycle) |
+| §16 (Isolation) | Per-isolated-package metrics use `install_prefix` label |
+
+The telemetry system is a **cross-cutting concern** that touches
+multiple use cases but is implemented as its own package.
+
+### 17.10 v1 scope
+
+| Feature | v1 | v1.1+ |
+| --------- | ---- | ------- |
+| Built-in process metrics | ✅ | ✅ |
+| Built-in file rendering metrics | ✅ | ✅ |
+| Built-in system/self metrics | ✅ | ✅ |
+| HTTP `/metrics` endpoint | ✅ | ✅ |
+| Unix socket endpoint | ✅ | ✅ |
+| `/health` endpoint | ✅ | ✅ |
+| Custom plugin metrics | ❌ | ✅ |
+| TLS on endpoint | ❌ | ✅ |
+| Auth (bearer token) | ❌ | ✅ |
+| IP allowlist | ❌ | ✅ |
+| Push to Pushgateway | ❌ | v1.2 |
+| Remote-write | ❌ | v1.2 |
+| Histogram metrics | ❌ | ✅ |
+| Metric label allowlist | ❌ | ✅ |
+
+v1 ships with:
+
+- All built-in metrics (process, file, system)
+- HTTP `/metrics` endpoint (default Unix socket, opt-in TCP)
+- `/health` endpoint
+- No auth/TLS (documented: "bind to localhost or Unix socket")
+
+v1.1 adds:
+
+- Plugin custom metrics
+- TLS + auth + allowlist
+
+v1.2 adds:
+
+- Push model
+- Remote-write
+
+### 17.11 Why this matters
+
+Without metrics, ezx is **invisible** to monitoring systems. An
+SRE running ezx in production cannot:
+
+- Know if a process is down without `docker exec`
+- Alert on restart loops
+- Correlate file rendering drift with application errors
+- Build a Grafana dashboard for the container
+- Integrate with PagerDuty / Opsgenie
+
+With metrics, ezx is **observable**:
+
+- Prometheus alerts on `ezx_process_up == 0`
+- Grafana dashboards show process health, restart rates, memory
+- Correlation between config drift (`ezx_file_reconcile_drift_total`)
+  and application errors
+- Plugin vendors expose their own metrics (e.g., replication lag
+  for a PostgreSQL HA plugin)
+
+This is table stakes for any modern container runtime. The user
+doesn't need to ask for it — they expect it.
+
 ---
