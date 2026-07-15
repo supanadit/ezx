@@ -6129,4 +6129,616 @@ The v1 security story is **good enough for production** if
 the user follows the security checklist (§14.14). The v1.1+
 features add defense in depth.
 
+## 15. Package management: mixed source/apt with transitive dependencies
+
+The current design's §4.6 "Sources" provides a **low-level**
+model: the user writes `setup.steps[]` explicitly, manually
+ordering steps with `requires:` and manually specifying which
+packages come from apt vs. which are built from source. This
+works for simple cases but breaks down when:
+
+- You build postgresql from source and need to know it
+  transitively requires openssl, readline, zlib
+- You want a custom curl version that isn't in apt
+- You want to upgrade one library and need to know which
+  packages depend on it
+- You want the build stage to have a compiler but the final
+  image to not
+
+The phpv project solves this with a **declarative package
+manager** that resolves transitive dependencies automatically.
+ezx should offer the same, alongside the low-level model.
+
+### 15.1 Two modes: low-level steps and high-level packages
+
+ezx offers **two complementary models** for the setup phase:
+
+| Model | When to use | Complexity | User writes |
+| ------- | ------------- | ------------ | ------------ |
+| **Low-level** (`setup.steps[]`) | Simple cases, full control, no transitive deps | Low | Every step explicitly |
+| **High-level** (`setup.packages[]`) | Real-world stacks with transitive deps, mixed apt/source | Medium | Just the packages they want |
+
+The user picks one (or mixes them). Both models produce the
+same internal representation (a DAG of build steps) and the
+same execution engine.
+
+#### Low-level: `setup.steps[]` (existing, unchanged)
+
+```yaml
+setup:
+  steps:
+    - name: apt-base
+      run: apt-get install -y build-essential libreadline-dev libssl-dev zlib1g-dev
+    - name: postgresql
+      requires: [apt-base]
+      source: { type: autotools, url: "...", checksum: "..." }
+    - name: cleanup
+      requires: [postgresql]
+      run: apt-get purge -y build-essential *-dev
+```
+
+The user writes every step, every dep, every cleanup. Full
+control, but high maintenance.
+
+#### High-level: `setup.packages[]` (new)
+
+```yaml
+setup:
+  packages:
+    - name: postgresql
+      version: "16.4"
+    - name: pgbouncer
+      version: "1.23.1"
+    - name: curl
+      version: "8.10.0"
+      source: build    # always build from source
+```
+
+ezx resolves the dependency graph, picks apt vs. source for
+each dep, generates the build plan, and runs it. The user
+just declares what they want.
+
+### 15.2 The package manifest
+
+For ezx to resolve dependencies, each package needs a
+**manifest** that declares:
+
+- Its name, version, source URL, checksum
+- Its dependencies (other packages, with version constraints)
+- Its build configuration
+- Whether deps are build-time or runtime
+
+Built-in manifests live in `internal/repository/memory/packages/`.
+Users can add custom manifests in their `ezx.setup.yaml`.
+
+```yaml
+# internal/repository/memory/packages/postgresql.yaml
+name: postgresql
+type: source                    # source | apt
+registry: postgresql            # which built-in registry resolves the URL
+versions: ["16.4", "16.3", "16.2", "16.1", "16.0", "15.8", "15.7", ...]
+default_version: "16.4"
+dependencies:
+  - name: openssl
+    constraint: ">= 1.1.0"
+    type: optional              # postgresql can build without openssl
+  - name: readline
+    constraint: ">= 6.0"
+    type: required
+  - name: zlib
+    constraint: ">= 1.2.0"
+    type: required
+  - name: gcc
+    constraint: ">= 4.0"
+    type: build-time             # only needed during build
+  - name: make
+    constraint: ">= 3.0"
+    type: build-time
+build:
+  configure: [./configure, "--prefix=/usr/local/pgsql", "--with-openssl", "--with-readline"]
+  build:     [make, "-j{{ .BuildJobs }}", world]
+  install:   [make, install-world]
+provides:
+  binaries: [psql, postgres, pg_ctl, initdb]
+  headers:  [libpq-fe.h]
+  libs:     [libpq.so]
+```
+
+For apt packages, the manifest is simpler:
+
+```yaml
+# internal/repository/memory/packages/libreadline-dev.yaml
+name: libreadline-dev
+type: apt
+versions: ["8.2-1.3"]           # whatever apt has
+provides:
+  apt_package: libreadline-dev
+  libs: [libreadline.so]
+  headers: [readline.h]
+```
+
+### 15.3 The dependency resolver
+
+The resolver takes the user's `setup.packages[]` list and
+produces a **complete build plan** with all transitive
+dependencies resolved.
+
+```go
+// assembler/service.go (new use case)
+type PackageRequest struct {
+    Name      string
+    Version   string            // empty = use default
+    Source    string            // auto | apt | build | system
+}
+
+type BuildPlan struct {
+    Steps []BuildStep
+}
+
+type BuildStep struct {
+    Name         string
+    Type         StepType       // apt | source | cleanup
+    Package      string         // apt package name or source name
+    Version      string         // resolved version
+    DependsOn    []string       // step names this depends on
+    Satisfies    []string       // constraints this step satisfies
+    Source       *SourceSpec    // for type=source
+    Cleanup      *CleanupSpec   // for type=cleanup
+}
+
+func (s *Service) ResolvePackages(ctx context.Context, reqs []PackageRequest) (*BuildPlan, error) {
+    // 1. Walk the dependency graph, collecting all required packages
+    // 2. For each package, resolve version constraints
+    // 3. For each dep, decide: apt or source build?
+    // 4. Use the registry to get source URLs
+    // 5. Return a BuildPlan
+}
+```
+
+#### The resolution algorithm
+
+```
+1. Initialize the "needed" set with the user's requested packages
+2. While needed is not empty:
+   a. Pick a package from needed
+   b. Look up its manifest (built-in or user-defined)
+   c. If source=auto: decide based on availability
+      - If the user's apt has a compatible version, use apt
+      - Otherwise, build from source
+   d. For each of its dependencies:
+      - Add to needed if not already resolved
+      - Record the constraint (e.g., "openssl >= 1.1.0")
+3. Resolve version constraints:
+   - For each package, find the highest version that satisfies
+     all constraints
+   - For apt packages, use whatever apt provides
+   - For source packages, pick from the available versions
+4. Detect conflicts:
+   - If two packages require incompatible versions of the same
+     dep, report a conflict
+5. Topological sort:
+   - Order the build steps so deps come first
+6. Generate cleanup:
+   - For each build-time dep, add a cleanup step at the end
+7. Return the BuildPlan
+```
+
+#### The "auto" source decision
+
+For each package, `source: auto` means "ezx decides". The
+decision tree:
+
+```
+Is the package in apt?
+  └── Yes → use apt (system version)
+  └── No  → is the package's source URL resolvable?
+            └── Yes → build from source
+            └── No  → ERROR: "no source for package X"
+```
+
+The user can override:
+
+```yaml
+setup:
+  packages:
+    - name: openssl
+      version: "3.0.0"        # pin a specific version
+      source: build           # always build, even if apt has it
+```
+
+This is how the user's "custom curl" works:
+
+```yaml
+setup:
+  packages:
+    - name: curl
+      version: "8.10.0"       # specific version
+      source: build           # always build from source
+      # Even if apt has curl 8.5.0, we build 8.10.0
+```
+
+### 15.4 The build plan (output of the resolver)
+
+The resolver produces a `BuildPlan` that can be inspected:
+
+```bash
+$ ezx setup plan --config ezx.setup.yaml
+
+# Build plan for postgresql-sandbox:
+
+Step 1: apt-base
+  Type: apt
+  Packages: build-essential, libssl-dev, libreadline-dev,
+            zlib1g-dev, libevent-dev
+  Satisfies: gcc>=4.0, make>=3.0, openssl>=1.1.0, readline>=6.0,
+             zlib>=1.2.0, libevent>=2.0
+
+Step 2: postgresql
+  Type: source
+  Version: 16.4
+  Source: https://ftp.postgresql.org/.../postgresql-16.4.tar.gz
+  Depends on: apt-base
+  Provides: psql, postgres, pg_ctl
+
+Step 3: pgbouncer
+  Type: source
+  Version: 1.23.1
+  Source: https://www.pgbouncer.org/.../pgbouncer-1.23.1.tar.gz
+  Depends on: apt-base
+  Provides: pgbouncer
+
+Step 4: curl
+  Type: source
+  Version: 8.10.0
+  Source: https://curl.se/.../curl-8.10.0.tar.gz
+  Depends on: apt-base
+  Provides: curl
+
+Step 5: cleanup
+  Type: cleanup
+  Removes: build-essential, libssl-dev, libreadline-dev,
+           zlib1g-dev, libevent-dev
+  Depends on: postgresql, pgbouncer, curl
+
+# 5 steps, 3 source builds, 1 apt install, 1 cleanup
+```
+
+The user can `ezx setup plan` to see what ezx will do before
+running the build.
+
+### 15.5 Mixed execution: apt + source builds
+
+The build executor consumes the `BuildPlan` and runs each step
+in topological order:
+
+```go
+// setup/service.go (extends existing)
+func (s *Service) Execute(ctx context.Context, plan *BuildPlan) error {
+    for _, step := range plan.Steps {
+        switch step.Type {
+        case StepTypeApt:
+            return s.runAptInstall(ctx, step)
+        case StepTypeSource:
+            return s.runSourceBuild(ctx, step)
+        case StepTypeCleanup:
+            return s.runCleanup(ctx, step)
+        }
+    }
+}
+```
+
+The executor:
+
+1. Runs each step in the right order (deps first)
+2. Caches the result (per §5.4 "Build-time caching")
+3. Logs progress with the package name and version
+4. Fails fast on any error (with the step name and exit code)
+
+### 15.6 Build-time vs. runtime dependencies
+
+This is the key to the user's question: **the compiler is
+always in the build stage but never in the final image**.
+
+Each dependency in a manifest has a `type`:
+
+- `type: build-time` — needed only during compilation
+- `type: runtime` — needed at runtime too
+- `type: optional` — used if available, but not required
+
+The resolver tracks which deps are build-time only. The
+cleanup step automatically removes them:
+
+```yaml
+# postgresql.yaml
+dependencies:
+  - name: gcc
+    type: build-time       # → removed by cleanup
+  - name: openssl
+    type: optional         # → kept at runtime (for SSL support)
+  - name: readline
+    type: required         # → kept at runtime
+```
+
+The cleanup step generated by the resolver:
+
+```yaml
+# Auto-generated by assembler
+- name: cleanup
+  type: cleanup
+  removes:
+    - build-essential         # gcc, g++, make
+    - libssl-dev              # openssl headers (but not libssl3)
+    - libreadline-dev         # readline headers (but not libreadline8)
+    - zlib1g-dev              # zlib headers (but not zlib1g)
+    - libevent-dev            # libevent headers (but not libevent-2.1)
+  keep:
+    - libssl3                 # runtime SSL
+    - libreadline8            # runtime readline
+    - zlib1g                  # runtime zlib
+    - libevent-2.1            # runtime libevent
+```
+
+ezx is smart enough to **keep the runtime package** (e.g.,
+`libssl3`) while **removing only the dev package** (e.g.,
+`libssl-dev`). This is automatic based on the `*-dev` naming
+convention.
+
+#### User override
+
+The user can keep build-time deps if they want (e.g., for
+development images):
+
+```yaml
+setup:
+  packages:
+    - name: postgresql
+      version: "16.4"
+      keep_build_deps: true    # keep the compiler (for dev images)
+```
+
+Or remove more aggressively (for minimal images):
+
+```yaml
+setup:
+  packages:
+    - name: postgresql
+      version: "16.4"
+      # Default: keep all runtime deps
+      # Aggressive: remove optional deps too
+      minimal: true
+```
+
+### 15.7 The custom-curl example (the user's exact case)
+
+User wants: "custom curl version that didn't want from apt or
+dnf install".
+
+```yaml
+# ezx.setup.yaml
+setup:
+  packages:
+    - name: postgresql
+      version: "16.4"
+    - name: pgbouncer
+      version: "1.23.1"
+    - name: curl
+      version: "8.10.0"       # the user's custom version
+      source: build           # always build from source
+```
+
+ezx's resolver produces:
+
+```
+Step 1: apt-base
+  Type: apt
+  Packages: build-essential, libssl-dev, libreadline-dev,
+            zlib1g-dev, libevent-dev
+  Satisfies: gcc, make, openssl-dev, readline-dev, zlib-dev, libevent-dev
+
+Step 2: postgresql
+  Type: source
+  Version: 16.4
+  Source: https://ftp.postgresql.org/.../postgresql-16.4.tar.gz
+  Depends on: apt-base
+  Build: ./configure --with-openssl --with-readline && make world && make install-world
+
+Step 3: pgbouncer
+  Type: source
+  Version: 1.23.1
+  Source: https://www.pgbouncer.org/.../pgbouncer-1.23.1.tar.gz
+  Depends on: apt-base
+  Build: ./configure && make && make install
+
+Step 4: curl
+  Type: source
+  Version: 8.10.0
+  Source: https://curl.se/.../curl-8.10.0.tar.gz
+  Depends on: apt-base
+  Build: ./configure --with-openssl && make && make install
+
+Step 5: cleanup
+  Type: cleanup
+  Removes: build-essential, libssl-dev, libreadline-dev, zlib1g-dev, libevent-dev
+  Keeps:   libssl3, libreadline8, zlib1g, libevent-2.1
+```
+
+Final image contains:
+
+- postgresql 16.4 (built from source)
+- pgbouncer 1.23.1 (built from source)
+- curl 8.10.0 (built from source) — **the user's custom version**
+- libssl3, libreadline8, zlib1g, libevent-2.1 (runtime libs only)
+- **No compiler** (build-essential removed)
+- **No dev headers** (all *-dev removed)
+
+Exactly what the user asked for.
+
+### 15.8 Custom package manifests
+
+Users can add their own packages in the YAML:
+
+```yaml
+setup:
+  packages:
+    - name: my-custom-thing
+      type: source
+      url: https://example.com/my-thing-1.0.tar.gz
+      checksum: sha256:abc123...
+      dependencies:
+        - name: openssl
+          constraint: ">= 1.1.0"
+          type: required
+        - name: zlib
+          constraint: ">= 1.2.0"
+          type: optional
+      build:
+        configure: [./configure, --prefix=/usr/local, --with-openssl]
+        build:     [make, "-j{{ .BuildJobs }}"]
+        install:   [make, install]
+      provides:
+        binaries: [my-thing]
+```
+
+ezx merges the user's manifests with the built-in ones at
+load time. Conflict detection (§13) catches any conflicts
+(e.g., two packages providing the same binary).
+
+### 15.9 Constraint conflicts (the "incompatible versions" problem)
+
+What if the user wants:
+
+- postgresql 16.4 (needs openssl >= 1.1.0)
+- some-old-thing (needs openssl < 1.0.0)
+
+The resolver detects this and reports a conflict:
+
+```
+✗ CONFLICT: incompatible version constraints for "openssl"
+  Required by:
+    - postgresql 16.4: openssl >= 1.1.0
+    - some-old-thing 1.0: openssl < 1.0.0
+  Resolution: upgrade some-old-thing to a newer version,
+  or remove postgresql, or use a different openssl.
+```
+
+The user must resolve the conflict before ezx will build.
+
+### 15.10 The assembler package (new use case)
+
+To support this, we add a new use case package:
+
+```
+ezx/
+├── assembler/                     # NEW USE CASE — package resolution
+│   │                             # Mirrors phpv's assembler
+│   ├── service.go                # ResolvePackages, ExecutePlan
+│   ├── resolver.go               # constraint satisfaction
+│   ├── planner.go                # build plan generator
+│   ├── manifest.go               # PackageManifest type
+│   └── service_test.go
+├── internal/
+│   ├── repository/
+│   │   ├── memory/
+│   │   │   ├── packages/         # NEW — built-in package manifests
+│   │   │   │   ├── postgresql.yaml
+│   │   │   │   ├── pgbouncer.yaml
+│   │   │   │   ├── curl.yaml
+│   │   │   │   ├── openssl.yaml
+│   │   │   │   ├── zlib.yaml
+│   │   │   │   └── ...
+│   │   │   └── packages.go       # PackageRepository implementation
+│   │   └── disk/
+│   │       └── packages.go       # for user-defined packages
+```
+
+The `assembler/` package:
+
+- Defines `PackageManifest`, `PackageRequest`, `BuildPlan` types in `domain/`
+- Implements constraint satisfaction (uses a SAT solver or simple backtracking)
+- Calls `registry/` for source URL resolution
+- Calls `setup/` for build execution
+- Is wired in `app/main.go` via fx
+
+### 15.11 Integration with existing design
+
+The new high-level model **extends** the existing design:
+
+- **§4.6 (Sources)**: stays as-is for low-level users. The
+  `source:` field in `setup.packages[]` is the same as the
+  `source:` field in `setup.steps[]`.
+- **§11.3 (Plugin model)**: plugins can provide custom package
+  manifests via schema extensions. A plugin like
+  `php-packages` could register manifests for `php`, `php-fpm`,
+  `php-redis`, etc.
+- **§13 (Conflict detection)**: extends to detect version
+  conflicts in the high-level model.
+- **§14.8 (Setup phase security)**: applies to both low and
+  high-level models. Source verification is the same.
+
+### 15.12 v1 scope
+
+| Feature | v1 | v1.1+ |
+| --------- | --- | ------ |
+| `setup.steps[]` (low-level, current) | ✅ | ✅ |
+| `setup.packages[]` (high-level) | ❌ | ✅ |
+| Built-in package manifests (10-20 common packages) | ❌ | ✅ |
+| Dependency resolver | ❌ | ✅ |
+| Constraint satisfaction (version ranges) | ❌ | ✅ |
+| Build plan generator | ❌ | ✅ |
+| Automatic compiler stripping | ❌ | ✅ |
+| Custom package manifests in user YAML | ❌ | ✅ |
+| Version constraints in custom manifests | ❌ | ✅ |
+| Conflict detection (incompatible versions) | ❌ | ✅ (extends §13) |
+| Mixed apt + source builds | ❌ | ✅ |
+| `ezx setup plan` subcommand | ❌ | ✅ |
+| `ezx setup why <package>` (explain why a package is included) | ❌ | ✅ |
+
+v1 ships with the **low-level `setup.steps[]` only**. The
+high-level `setup.packages[]` is a v1.1+ feature.
+
+This is consistent with the v1 philosophy: **v1 is the smallest
+possible thing that solves the original problem** (basic
+postgresql sandbox). The high-level model is a significant
+addition that requires:
+
+- A constraint solver (or backtracking algorithm)
+- A package manifest format
+- A built-in manifest database
+- A build plan generator
+- A way to detect version conflicts
+
+These are all substantial work. v1.1 is the right milestone.
+
+### 15.13 Why this matters
+
+The current design's `setup.steps[]` works for simple cases
+but doesn't scale. Real-world stacks have:
+
+- 10-50 packages to build
+- Transitive library dependencies
+- Custom versions that aren't in apt
+- Mixed apt + source builds
+- Build-time vs. runtime distinction
+
+The phpv model handles all of this declaratively. ezx should
+too. The high-level `setup.packages[]` is the answer.
+
+Without it, ezx users have to:
+
+- Manually figure out the transitive deps
+- Manually decide apt vs. source
+- Manually write cleanup steps
+- Hope they got it right
+
+With it, ezx users just declare what they want and ezx
+handles the rest. This is the same UX as:
+
+- `apt install postgresql` (apt handles deps automatically)
+- `cargo build` (cargo handles deps automatically)
+- `go get github.com/foo/bar` (go modules handle deps automatically)
+- `composer require php` (composer handles deps automatically)
+
+ezx should join this list of "package managers that handle
+transitive deps for you."
+
 ---
