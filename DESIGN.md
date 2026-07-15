@@ -9446,4 +9446,472 @@ This is **essential for production operations**. It's what
 turns ezx from a "container tool" into a "container
 platform."
 
+## 22. Environment variable scoping and filtering
+
+In Docker Compose, each service (container) gets its own
+environment. Env vars defined at the top level are shared;
+env vars defined per-service are isolated. This works because
+**each service runs in its own OS process tree** with its own
+`environ`.
+
+In ezx, **multiple processes run in the same container**,
+sharing the same kernel and the same initial environment.
+Without explicit scoping, **every process sees every env var** —
+including secrets, tokens, and noise that other processes don't
+need. This is a **security and operational problem**:
+
+- **pgbouncer** doesn't need `AWS_SECRET_ACCESS_KEY`
+- **patroni** doesn't need `PGPASSWORD` (it has its own auth)
+- **a custom exporter** shouldn't see `DATABASE_URL` with
+credentials
+- **ezx itself** doesn't need `PATH` pollution from plugins
+
+The design must support **global env vars** (shared),
+**process-scoped env vars** (isolated), and **filtering**
+(whitelist/denylist per process).
+
+### 22.1 The inheritance model
+
+When ezx starts a managed process, the process's environment
+is built from three layers, in order of application:
+
+```
+Layer 1: Container runtime env vars
+         (inherited from Docker/Kubernetes/cloud)
+         e.g. PATH, HOSTNAME, KUBERNETES_SERVICE_HOST
+
+Layer 2: ezx global env vars
+         (defined in runtime.environment)
+         e.g. PGDATA, PGPORT, PGUSER
+
+Layer 3: Process-scoped env vars
+         (defined in process.environment)
+         e.g. PGBOUNCER_LISTEN_PORT, PATRONI_ETCD_HOSTS
+
+Final env = Layer 1 ∪ Layer 2 ∪ Layer 3
+            (later layers override earlier layers)
+```
+
+This is the same model as Docker Compose (global `environment:`
+- per-service `environment:`) and Kubernetes (Pod env +
+container env).
+
+### 22.2 Global env vars
+
+Global env vars are available to **all** managed processes.
+They are defined at the `runtime` level:
+
+```yaml
+runtime:
+  # Global environment: all processes see these
+  environment:
+    PGDATA: /var/lib/postgresql/data
+    PGPORT: "5432"
+    PGUSER: postgres
+    PGPASSWORD: "{{ .Env.PGPASSWORD }}"   # from container secret
+    TZ: UTC
+    LC_ALL: en_US.UTF-8
+  
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          arguments: ["-D", "{{ .Env.PGDATA }}"]
+          # postmaster sees: PATH, HOSTNAME, PGDATA, PGPORT, PGUSER, PGPASSWORD, TZ, LC_ALL
+      
+      - name: pgbouncer
+        process:
+          binaryPath: /usr/local/bin/pgbouncer
+          arguments: ["/etc/pgbouncer/pgbouncer.ini"]
+          # pgbouncer sees: PATH, HOSTNAME, PGDATA, PGPORT, PGUSER, PGPASSWORD, TZ, LC_ALL
+```
+
+Global env vars are the **default** for shared configuration
+that all processes need (database directory, port, timezone).
+
+### 22.3 Process-scoped env vars
+
+Process-scoped env vars are **only visible to that process**.
+They override global env vars with the same name:
+
+```yaml
+runtime:
+  environment:
+    PGDATA: /var/lib/postgresql/data
+    PGPORT: "5432"
+  
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          arguments: ["-D", "{{ .Env.PGDATA }}"]
+          environment:
+            # postmaster-specific env vars
+            POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+            # Override global PGPORT for postmaster (it binds to 5432)
+            PGPORT: "5432"
+      
+      - name: pgbouncer
+        process:
+          binaryPath: /usr/local/bin/pgbouncer
+          arguments: ["/etc/pgbouncer/pgbouncer.ini"]
+          environment:
+            # pgbouncer-specific env vars
+            PGBOUNCER_LISTEN_PORT: "6432"
+            # pgbouncer doesn't see POSTGRES_INITDB_ARGS
+            # pgbouncer sees PGPORT="5432" (from global, not overridden)
+```
+
+Process-scoped env vars are the **default** for process-specific
+configuration (ports, auth, feature flags).
+
+### 22.4 Env var filtering (whitelist/denylist)
+
+Even with global and scoped env vars, the container runtime
+injects env vars that processes don't need. ezx supports
+**filtering** per process:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          environment:
+            PGDATA: /var/lib/postgresql/data
+          env_filter:
+            # Whitelist: only these env vars are passed to postmaster
+            allow:
+              - "PG*"           # all PG-prefixed vars
+              - "PATH"
+              - "LANG"
+              - "LC_*"
+              - "TZ"
+              - "HOME"
+              - "USER"
+            # Denylist: explicitly exclude these (even if they match allow)
+            deny:
+              - "*_TOKEN*"     # any token
+              - "*_SECRET*"   # any secret
+              - "*_PASSWORD*" # any password
+              - "AWS_*"        # AWS credentials
+              - "KUBERNETES_*" # k8s internal vars (noise)
+              - "ETCD_*"       # etcd vars (not needed by postgres)
+```
+
+The filter logic:
+
+```go
+// internal/repository/system/env.go
+func BuildProcessEnv(
+    containerEnv map[string]string,    // Layer 1
+    globalEnv map[string]string,       // Layer 2
+    scopedEnv map[string]string,       // Layer 3
+    filter EnvFilter,                  // filtering rules
+) map[string]string {
+    result := make(map[string]string)
+    
+    // Start with container env (Layer 1)
+    for k, v := range containerEnv {
+        result[k] = v
+    }
+    
+    // Apply global env (Layer 2)
+    for k, v := range globalEnv {
+        result[k] = v
+    }
+    
+    // Apply scoped env (Layer 3, overrides)
+    for k, v := range scopedEnv {
+        result[k] = v
+    }
+    
+    // Apply filter
+    if len(filter.Allow) > 0 {
+        // Whitelist mode: only keep allowed keys
+        filtered := make(map[string]string)
+        for k, v := range result {
+            if matchesAny(k, filter.Allow) && !matchesAny(k, filter.Deny) {
+                filtered[k] = v
+            }
+        }
+        result = filtered
+    } else if len(filter.Deny) > 0 {
+        // Denylist mode: remove denied keys
+        for k := range result {
+            if matchesAny(k, filter.Deny) {
+                delete(result, k)
+            }
+        }
+    }
+    
+    return result
+}
+```
+
+Filtering supports glob patterns:
+
+- `"PG*"` — matches `PGDATA`, `PGPORT`, `PGUSER`, etc.
+- `"*_TOKEN*"` — matches `API_TOKEN`, `AWS_ACCESS_TOKEN`, etc.
+- `"LANG"` — exact match
+
+### 22.5 Default filter (sensible defaults)
+
+If no filter is specified, ezx applies a **sensible default
+filter** that removes known-noise env vars:
+
+```go
+var DefaultDenyList = []string{
+    // Kubernetes internals (noise)
+    "KUBERNETES_*",
+    "KUBERNETES_PORT",
+    "KUBERNETES_PORT_*",
+    
+    // Docker internals (noise)
+    "DOCKER_*",
+    
+    // Cloud provider metadata (noise)
+    "ECS_*",
+    "EC2_*",
+    "GKE_*",
+    "AZURE_*",
+    
+    // ezx internals (should not leak)
+    "EZX_INTERNAL_*",
+    
+    // Build-time vars (should not be at runtime)
+    "BUILD_*",
+    "CI_*",
+    "GITHUB_*",
+    "TRAVIS_*",
+    "CIRCLECI_*",
+}
+```
+
+The user can override the default filter:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          env_filter:
+            # Replace the default denylist entirely
+            replace_defaults: true
+            allow: ["PG*", "PATH", "LANG", "HOME"]
+            deny: []
+```
+
+### 22.6 Secret env vars and filtering
+
+§14 (Security) covers secrets. Filtering is the **runtime
+enforcement** of that policy:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          env_filter:
+            allow: ["PG*", "PATH", "LANG"]
+            deny: ["*_TOKEN*", "*_SECRET*", "*_PASSWORD*", "DATABASE_URL"]
+```
+
+Even if the container runtime injects `DATABASE_URL=postgres://user:secret@host/db`,
+postmaster never sees it. This prevents:
+
+- Accidental logging of secrets (process dumps env for debugging)
+- Plugin leakage (a compromised plugin reads another process's env)
+- Core dump leakage (core dumps contain the full env)
+
+### 22.7 Docker Compose migration
+
+When migrating from Docker Compose, the mapping is:
+
+```yaml
+# docker-compose.yaml (source)
+services:
+  postgresql:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydb
+    env_file:
+      - ./postgres.env
+  
+  pgbouncer:
+    image: pgbouncer:latest
+    environment:
+      POOL_MODE: transaction
+    env_file:
+      - ./pgbouncer.env
+```
+
+```yaml
+# ezx.runtime.yaml (target)
+runtime:
+  # Global env: common vars from both services
+  environment:
+    # From docker-compose top-level (if any)
+    # In this case, none — each service is independent
+  
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          # Per-service env from docker-compose
+          environment:
+            POSTGRES_USER: myuser
+            POSTGRES_PASSWORD: "{{ .Env.POSTGRES_PASSWORD }}"  # from secret
+            POSTGRES_DB: mydb
+          # From env_file: ./postgres.env
+          env_file:
+            - /etc/postgresql/postgres.env
+      
+      - name: pgbouncer
+        process:
+          binaryPath: /usr/local/bin/pgbouncer
+          # Per-service env from docker-compose
+          environment:
+            POOL_MODE: transaction
+          # From env_file: ./pgbouncer.env
+          env_file:
+            - /etc/pgbouncer/pgbouncer.env
+```
+
+The `env_file` field (new) loads env vars from a file at
+runtime, matching Docker Compose's behavior.
+
+### 22.8 The `env_file` field
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          binaryPath: /usr/local/pgsql/bin/postgres
+          env_file:
+            - /etc/postgresql/postgres.env      # absolute path
+            - ./local.env                        # relative to ezx.runtime.yaml
+          environment:
+            # These override values from env_file
+            PGPORT: "5433"
+```
+
+Loading order:
+
+1. Container runtime env vars (Layer 1)
+2. Global `runtime.environment` (Layer 2)
+3. `env_file` entries, in order (Layer 3a)
+4. `process.environment` (Layer 3b, overrides env_file)
+
+Later values override earlier values. This matches Docker
+Compose's precedence rules.
+
+### 22.9 Env var validation
+
+At config load time, ezx validates env var references:
+
+```yaml
+runtime:
+  processChain:
+    roots:
+      - name: postmaster
+        process:
+          arguments: ["-D", "{{ .Env.PGDATA }}"]
+          environment:
+            # PGDATA is referenced in arguments but never defined
+            # ezx reports: ERROR: env var "PGDATA" referenced but not defined
+```
+
+Validation rules:
+
+1. All `{{ .Env.VAR }}` references must resolve to a defined
+   env var (global, scoped, or container runtime)
+2. All `env_file` paths must exist (or be marked optional)
+3. No circular references in env var values (A references B
+   which references A)
+4. Secret env vars (marked with `sensitive: true`) trigger
+   warnings if not filtered
+
+### 22.10 Operational API for env vars
+
+The operational API (§21) extends to support live env var
+changes:
+
+```bash
+# Get current env for a process
+GET /api/v1/processes/postmaster/env
+
+# Update a process-scoped env var (triggers process restart)
+PATCH /api/v1/processes/postmaster/env
+# Body: {"PGPORT": "5433"}
+
+# Update a global env var (triggers restart of all affected processes)
+PATCH /api/v1/environment
+# Body: {"PGPORT": "5433"}
+
+# Get env var validation report
+GET /api/v1/environment/validate
+# Response: {"undefined": ["PGDATA"], "unused": ["OLD_VAR"]}
+```
+
+Live env var changes are **v1.1+**. They require:
+
+1. Detecting which processes are affected by the change
+2. Gracefully restarting affected processes (in dependency order)
+3. Rolling back if restart fails
+
+### 22.11 v1 scope
+
+| Feature | v1 | v1.1+ |
+| --------- | ---- | ------- |
+| Global env vars (`runtime.environment`) | ✅ | ✅ |
+| Process-scoped env vars (`process.environment`) | ✅ | ✅ |
+| Env var inheritance (container → global → scoped) | ✅ | ✅ |
+| Env var filtering (allow/deny with globs) | ✅ | ✅ |
+| Default denylist (noise reduction) | ✅ | ✅ |
+| `env_file` per process | ✅ | ✅ |
+| Env var validation at load time | ✅ | ✅ |
+| Secret env var filtering enforcement | ✅ | ✅ |
+| Live env var update via API | ❌ | ✅ |
+| Env var validation report via API | ❌ | ✅ |
+| Env var diff (expected vs actual) | ❌ | ✅ |
+| Per-process env var audit log | ❌ | ✅ |
+
+v1 ships with full env var scoping, filtering, `env_file`, and
+validation. Live updates and audit logging are v1.1+.
+
+### 22.12 Why this matters
+
+Without env var scoping:
+
+- **Security risk**: pgbouncer sees `AWS_SECRET_ACCESS_KEY`
+- **Operational noise**: `KUBERNETES_SERVICE_HOST` leaks into
+  every process's error messages
+- **Config confusion**: "Which process uses `DATABASE_URL`?"
+- **Migration pain**: Docker Compose per-service env vars
+  become global in ezx (or require manual splitting)
+
+With env var scoping:
+
+- Each process sees only the env vars it needs
+- Secrets are contained to the processes that need them
+- Noise is filtered at the source
+- Docker Compose migration is mechanical (scriptable)
+- The principle of least privilege applies to environment
+  variables
+
+This is **not a nice-to-have** — it's a **security and
+operational requirement** for any multi-process container
+orchestrator.
+
 ---
