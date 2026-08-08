@@ -216,23 +216,49 @@ func executeOperation(op domain.FileOperation, target string, src envSource) err
 	}
 }
 
-// expandEnvVars substitutes ${VAR} references with environment values (empty if unset).
+// expandEnvVars substitutes ${VAR} and ${VAR:-default} references with environment
+// values from the process environment. ${VAR} expands to the value or "" if unset;
+// ${VAR:-default} expands to default when the variable is unset or empty, mirroring
+// POSIX shell semantics. When src is non-nil, the special references ${value}, ${name},
+// and ${N} resolve against the source instead (also supporting the :-default form).
 func expandEnvVars(s string, src *envSource) string {
+	return expandEnvVarsFrom(s, src, os.LookupEnv)
+}
+
+// expandEnvVarsFrom is expandEnvVars with an injectable lookup function, so the same
+// interpolation can resolve against an environ slice instead of the process env.
+func expandEnvVarsFrom(s string, src *envSource, lookup func(string) (string, bool)) string {
 	return envVarPattern.ReplaceAllStringFunc(s, func(m string) string {
 		name := strings.TrimSuffix(strings.TrimPrefix(m, "${"), "}")
+		def, hasDef := "", false
+		if before, after, ok := strings.Cut(name, ":-"); ok {
+			name, def, hasDef = before, after, true
+		}
 		if src != nil {
 			switch name {
 			case "value":
+				if hasDef && src.value == "" {
+					return def
+				}
 				return src.value
 			case "name":
+				if hasDef && src.name == "" {
+					return def
+				}
 				return src.name
 			}
 			if idx, err := strconv.Atoi(name); err == nil && idx >= 1 && idx <= len(src.captures) {
+				if hasDef && src.captures[idx-1] == "" {
+					return def
+				}
 				return src.captures[idx-1]
 			}
 		}
-		if v, ok := os.LookupEnv(name); ok {
+		if v, ok := lookup(name); ok && v != "" {
 			return v
+		}
+		if hasDef {
+			return def
 		}
 		return ""
 	})

@@ -8,8 +8,18 @@ package domain
 type Process struct {
 	// BinaryPath is the absolute or relative path to the executable binary (required; empty means invalid).
 	BinaryPath string
-	// Arguments is a slice of command-line arguments (optional; nil or empty slice means no args).
+	// Arguments is a slice of command-line arguments. Entries may contain ${VAR} and
+	// ${VAR:-default} interpolation resolved from the environment at spawn time
+	// (e.g., "--web.listen-address=:${PROMETHEUS_PORT:-9090}"). Conditional and
+	// env-derived arguments belong in ArgOperations or ArgsFunc.
 	Arguments []string
+	// ArgOperations declaratively builds additional arguments from environment variables
+	// (e.g., if-set flags, boolean toggles, comma-split lists, pattern enumeration).
+	// Appended after Arguments, before ArgsFunc.
+	ArgOperations []ArgOperation
+	// ArgsFunc generates CLI arguments from the environment with full control. It overrides
+	// ArgOperations when set and is concatenated after Arguments.
+	ArgsFunc ArgsFunc
 	// Environment is a slice of environment variables in "KEY=VALUE" format (optional; nil or empty means inherit from parent process).
 	Environment []string
 	// FilterEnv removes matching environment variables by exact name from the spawned

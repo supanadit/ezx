@@ -137,6 +137,31 @@ func main() {
 				},
 				Children: []domain.ProcessNode{
 					{
+						Name: "prometheus-demo",
+						Process: domain.Process{
+							BinaryPath: "/bin/sh",
+							// Static base args with ${VAR:-default} interpolation (Pattern 1)
+							Arguments: []string{"-c", "echo \"PROMETHEUS ARGS: $@\"", "prometheus"},
+							// Declarative env-to-arguments (ArgOperations)
+							ArgOperations: []domain.ArgOperation{
+								// if-set value (Pattern 2): only when PROMETHEUS_WEB_CONFIG_FILE is set
+								{Flag: "--web.config.file", FromEnv: "PROMETHEUS_WEB_CONFIG_FILE"},
+								// if-truthy bare flag (Pattern 3)
+								{When: domain.EnvCondition{Name: "PROMETHEUS_ENABLE_WEB_LIFECYCLE", Value: "true"}, Flag: "--web.enable-lifecycle", Format: domain.ArgFormatBareFlag},
+								// if-truthy feature (Pattern 5): literal value mapped from env
+								{When: domain.EnvCondition{Name: "PROMETHEUS_ENABLE_NATIVE_HISTOGRAM", Value: "true"}, Flag: "--enable-feature", Value: "native-histograms"},
+								// comma-split list (Pattern 6)
+								{Flag: "--endpoint", FromEnv: "THANOS_QUERY_STORE_ADDRESSES", Split: ","},
+								// pattern-enum with name transform (Pattern 7+10)
+								{Flag: "--label", FromEnvPattern: "^THANOS_RECEIVE_LABELS_(.+)$", Value: `${name}="${value}"`, NameTransform: domain.NameTransformLower},
+								// whitespace-split pass-through (Pattern 8)
+								{FromEnv: "THANOS_EXTRA_ARGS", Split: " ", Format: domain.ArgFormatRaw},
+							},
+							WorkingDir: "/tmp",
+						},
+						NeedParentReady: true,
+					},
+					{
 						Name: "hello-world-child-2",
 						Process: domain.Process{
 							BinaryPath: "/bin/sh",

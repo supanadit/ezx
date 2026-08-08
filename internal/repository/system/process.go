@@ -34,12 +34,19 @@ func (s *ProcessNodeRepository) Execute(ctx context.Context) (*exec.Cmd, error) 
 		return nil, err
 	}
 
+	// Build CLI arguments from the environment (env-to-arguments conversions).
+	// Runs after file provisioning so arg callbacks see the full environment.
+	args, err := buildArgs(s.ProcessNode.Process, os.Environ())
+	if err != nil {
+		return nil, err
+	}
+
 	env, err := buildProcessEnv(os.Environ(), s.ProcessNode.Process)
 	if err != nil {
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, s.ProcessNode.Process.BinaryPath, s.ProcessNode.Process.Arguments...)
+	cmd := exec.CommandContext(ctx, s.ProcessNode.Process.BinaryPath, args...)
 	cmd.Env = env
 	cmd.Dir = s.ProcessNode.Process.WorkingDir
 
