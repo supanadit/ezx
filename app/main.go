@@ -78,9 +78,33 @@ func main() {
 				Name: "hello-world-parent-1",
 				Process: domain.Process{
 					BinaryPath:  "/bin/sh",
-					Arguments:   []string{"-c", "echo \"$GREETING\""},
-					Environment: []string{"GREETING=Hello, EZX!"},
+					Arguments:   []string{"-c", "echo \"$GREETING\" && cat /tmp/ezx-pgbackrest.conf && cat /tmp/ezx-postgresql.conf"},
+					Environment: []string{"GREETING=Hello, EZX!", "NODE_ROLE=primary", "POSTGRESQL_CONFIG_SHARED_BUFFERS=128MB", "POSTGRESQL_CONFIG_MAX_CONNECTIONS=100"},
 					WorkingDir:  "/tmp",
+				},
+				Files: []domain.FileProvision{
+					{
+						Path:       "/tmp/ezx-pgbackrest.conf",
+						Permission: 0640,
+						When:       domain.EnvCondition{Name: "NODE_ROLE", Value: "primary"},
+						Operations: []domain.FileOperation{
+							{Type: domain.FileOpRemove, Pattern: "^pg2-"},
+							{Type: domain.FileOpSetProperty, Pattern: "^backup-standby=", Value: "backup-standby=n"},
+						},
+					},
+					{
+						Path: "/tmp/ezx-postgresql.conf",
+						Operations: []domain.FileOperation{
+							{
+								Type:           domain.FileOpSetProperty,
+								FromEnvPattern: "^POSTGRESQL_CONFIG_(.+)$",
+								NameTransform:  domain.NameTransformLower,
+								Pattern:        "^[[:space:]]*#?[[:space:]]*${name}[[:space:]]*=.*",
+								Value:          "${name} = ${value}",
+								ValueFormat:    domain.ValueFormatAuto,
+							},
+						},
+					},
 				},
 				Children: []domain.ProcessNode{
 					{
@@ -106,6 +130,8 @@ func main() {
 		},
 	}
 	pn1 := system.NewProcessNodeRepository(chainSample.Roots[0])
-	pn1.Execute(context.Background())
+	if _, err := pn1.Execute(context.Background()); err != nil {
+		fmt.Println("❌ EZX failed:", err)
+	}
 	fmt.Println("✅ EZX started successfully!")
 }

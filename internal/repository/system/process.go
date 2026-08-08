@@ -28,6 +28,11 @@ func (s *ProcessNodeRepository) Execute(ctx context.Context) (*exec.Cmd, error) 
 		}
 	}
 
+	// Provision files before starting the process (env-to-file conversions)
+	if err := provisionFiles(s.ProcessNode.Files); err != nil {
+		return nil, err
+	}
+
 	cmd := exec.CommandContext(ctx, s.ProcessNode.Process.BinaryPath, s.ProcessNode.Process.Arguments...)
 	cmd.Env = append(os.Environ(), s.ProcessNode.Process.Environment...)
 	cmd.Dir = s.ProcessNode.Process.WorkingDir

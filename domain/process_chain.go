@@ -7,6 +7,9 @@ type ProcessNode struct {
 	Name string
 	// Process holds the configuration for the executable.
 	Process Process
+	// Files is a slice of FileProvision rules applied before this process starts
+	// (optional; nil means no file provisioning). Env-to-file conversions run in order.
+	Files []FileProvision
 	// NeedParentReady indicates if this process requires its parent in the tree to be fully ready before starting (optional; defaults to false).
 	NeedParentReady bool
 	// Children is a slice of dependent child processes (recursive for unlimited depth).
