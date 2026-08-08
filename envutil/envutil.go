@@ -5,6 +5,7 @@
 package envutil
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -86,6 +87,67 @@ func NormalizeBool(value string) string {
 	default:
 		return ""
 	}
+}
+
+// Filter removes environment variables whose name exactly matches one of names or
+// matches any of the regex patterns from the given environ slice. It returns a new
+// slice; the input is not modified. It is the Go counterpart of shell `unset VAR`
+// and `env -u VAR` patterns.
+//
+// An invalid regex in patterns is returned as an error — a malformed pattern is a
+// configuration bug that must fail loudly rather than silently leak variables
+// through to the spawned process.
+func Filter(environ, names, patterns []string) ([]string, error) {
+	if len(names) == 0 && len(patterns) == 0 {
+		return environ, nil
+	}
+	exact := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		exact[n] = struct{}{}
+	}
+	var res []string
+	if len(patterns) > 0 {
+		re, err := compilePatterns(patterns)
+		if err != nil {
+			return nil, err
+		}
+		for _, kv := range environ {
+			name, _, ok := strings.Cut(kv, "=")
+			if !ok {
+				continue
+			}
+			if _, hit := exact[name]; hit {
+				continue
+			}
+			if re.MatchString(name) {
+				continue
+			}
+			res = append(res, kv)
+		}
+		return res, nil
+	}
+	for _, kv := range environ {
+		name, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if _, hit := exact[name]; hit {
+			continue
+		}
+		res = append(res, kv)
+	}
+	return res, nil
+}
+
+func compilePatterns(patterns []string) (*regexp.Regexp, error) {
+	var parts []string
+	for _, p := range patterns {
+		if _, err := regexp.Compile(p); err != nil {
+			return nil, fmt.Errorf("invalid filter pattern %q: %w", p, err)
+		}
+		parts = append(parts, "(?:"+p+")")
+	}
+	return regexp.Compile("(?:" + strings.Join(parts, "|") + ")")
 }
 
 // Match holds a single environment variable match from Enumerate.

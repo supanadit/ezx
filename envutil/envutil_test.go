@@ -180,3 +180,101 @@ func TestMatchStructFields(t *testing.T) {
 		t.Fatalf("captures = %v, want [CONFIG_MAX_LIMIT MAX_LIMIT]", m.Captures)
 	}
 }
+
+func TestFilterExactNames(t *testing.T) {
+	env := []string{"ETCD_NAME=n1", "ETCD_DATA_DIR=/data", "PATH=/usr/bin"}
+	got, err := Filter(env, []string{"ETCD_NAME", "ETCD_DATA_DIR"}, nil)
+	if err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	want := []string{"PATH=/usr/bin"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Filter = %v, want %v", got, want)
+	}
+}
+
+func TestFilterPatterns(t *testing.T) {
+	env := []string{
+		"PGBACKREST_REPO1_TYPE=s3",
+		"PGBACKREST_STANZA=main",
+		"POSTGRESQL_DB=app",
+		"PATH=/usr/bin",
+	}
+	got, err := Filter(env, nil, []string{"^PGBACKREST_"})
+	if err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	want := []string{"POSTGRESQL_DB=app", "PATH=/usr/bin"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Filter = %v, want %v", got, want)
+	}
+}
+
+func TestFilterNamesAndPatterns(t *testing.T) {
+	env := []string{
+		"MINIO_DATA_DIR=/data",
+		"MINIO_ROOT_USER=admin",
+		"PGBACKREST_STANZA=main",
+		"PATH=/usr/bin",
+	}
+	got, err := Filter(env, []string{"MINIO_DATA_DIR"}, []string{"^PGBACKREST_"})
+	if err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	want := []string{"MINIO_ROOT_USER=admin", "PATH=/usr/bin"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Filter = %v, want %v", got, want)
+	}
+}
+
+func TestFilterMinIOSelectiveKeepsCredentials(t *testing.T) {
+	env := []string{
+		"MINIO_DATA_DIR=/data",
+		"MINIO_ADDRESS=:9000",
+		"MINIO_CONSOLE_ADDRESS=:9001",
+		"MINIO_ROOT_USER=admin",
+		"MINIO_ROOT_PASSWORD=secret",
+	}
+	got, err := Filter(env, []string{
+		"MINIO_DATA_DIR",
+		"MINIO_ADDRESS",
+		"MINIO_CONSOLE_ADDRESS",
+		"MINIO_DISTRIBUTED_MODE_ENABLED",
+		"MINIO_DISTRIBUTED_NODES",
+	}, nil)
+	if err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	want := []string{"MINIO_ROOT_USER=admin", "MINIO_ROOT_PASSWORD=secret"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Filter = %v, want %v", got, want)
+	}
+}
+
+func TestFilterNoopWhenEmpty(t *testing.T) {
+	env := []string{"A=1", "B=2"}
+	got, err := Filter(env, nil, nil)
+	if err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	if !reflect.DeepEqual(got, env) {
+		t.Fatalf("Filter = %v, want input unchanged %v", got, env)
+	}
+}
+
+func TestFilterInputNotModified(t *testing.T) {
+	env := []string{"A=1", "B=2"}
+	original := []string{"A=1", "B=2"}
+	if _, err := Filter(env, []string{"A"}, nil); err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	if !reflect.DeepEqual(env, original) {
+		t.Fatalf("Filter modified input: %v", env)
+	}
+}
+
+func TestFilterInvalidPattern(t *testing.T) {
+	if _, err := Filter([]string{"A=1"}, nil, []string{"("}); err == nil {
+		t.Fatal("Filter with invalid pattern should return error")
+	}
+}

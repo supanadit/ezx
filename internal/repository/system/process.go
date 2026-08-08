@@ -6,6 +6,7 @@ import (
 	"os/exec"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/envutil"
 )
 
 type ProcessNodeRepository struct {
@@ -33,8 +34,13 @@ func (s *ProcessNodeRepository) Execute(ctx context.Context) (*exec.Cmd, error) 
 		return nil, err
 	}
 
+	env, err := buildProcessEnv(os.Environ(), s.ProcessNode.Process)
+	if err != nil {
+		return nil, err
+	}
+
 	cmd := exec.CommandContext(ctx, s.ProcessNode.Process.BinaryPath, s.ProcessNode.Process.Arguments...)
-	cmd.Env = append(os.Environ(), s.ProcessNode.Process.Environment...)
+	cmd.Env = env
 	cmd.Dir = s.ProcessNode.Process.WorkingDir
 
 	cmd.Stdout = os.Stdout
@@ -64,4 +70,16 @@ func (s *ProcessNodeRepository) Execute(ctx context.Context) (*exec.Cmd, error) 
 	println("Process Finished:", s.ProcessNode.Name)
 
 	return cmd, nil
+}
+
+// buildProcessEnv assembles the environment for a spawned process: the parent
+// environment filtered by the process's FilterEnv/FilterEnvPattern, with the
+// process's additive Environment entries appended last so they override any
+// inherited or filtered values.
+func buildProcessEnv(parentEnv []string, p domain.Process) ([]string, error) {
+	base, err := envutil.Filter(parentEnv, p.FilterEnv, p.FilterEnvPattern)
+	if err != nil {
+		return nil, err
+	}
+	return append(base, p.Environment...), nil
 }

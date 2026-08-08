@@ -12,6 +12,17 @@ type Process struct {
 	Arguments []string
 	// Environment is a slice of environment variables in "KEY=VALUE" format (optional; nil or empty means inherit from parent process).
 	Environment []string
+	// FilterEnv removes matching environment variables by exact name from the spawned
+	// process's environment (optional; nil or empty means no exact-name filtering).
+	// Applied at spawn time only — file-provisioning callbacks still see the full
+	// environment so they can consume vars into config files before they are stripped.
+	// Entries in Environment are appended after filtering and survive.
+	FilterEnv []string
+	// FilterEnvPattern removes environment variables whose name matches any of the given
+	// regex patterns from the spawned process's environment (optional; nil or empty means
+	// no pattern filtering). An invalid pattern is a configuration error and fails the
+	// spawn. Applied at spawn time only, same as FilterEnv.
+	FilterEnvPattern []string
 	// WorkingDir is the optional working directory (optional; empty string means use current directory).
 	WorkingDir string
 }

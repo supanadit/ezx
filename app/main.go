@@ -79,9 +79,13 @@ func main() {
 				Name: "hello-world-parent-1",
 				Process: domain.Process{
 					BinaryPath:  "/bin/sh",
-					Arguments:   []string{"-c", "echo \"$GREETING\" && cat /tmp/ezx-pgbackrest.conf && cat /tmp/ezx-postgresql.conf && cat /tmp/ezx-kafka.properties && cat /tmp/ezx-php.ini"},
-					Environment: []string{"GREETING=Hello, EZX!", "NODE_ROLE=primary", "POSTGRESQL_CONFIG_SHARED_BUFFERS=128MB", "POSTGRESQL_CONFIG_MAX_CONNECTIONS=100", "KAFKA_CONFIG_LOG_RETENTION_MS=60000", "KAFKA_CONFIG_NUM_PARTITIONS=3", "PHP_MEMORY_LIMIT=4096M"},
-					WorkingDir:  "/tmp",
+					Arguments:   []string{"-c", "echo \"GREETING=$GREETING\" && echo \"NODE_ROLE=${NODE_ROLE:-UNSET}\" && echo \"PG_SHARED_BUFFERS=${POSTGRESQL_CONFIG_SHARED_BUFFERS:-FILTERED}\" && echo \"KAFKA_RETENTION=${KAFKA_CONFIG_LOG_RETENTION_MS:-FILTERED}\" && echo \"PHP_MEMORY_LIMIT=${PHP_MEMORY_LIMIT:-FILTERED}\" && cat /tmp/ezx-pgbackrest.conf && cat /tmp/ezx-postgresql.conf && cat /tmp/ezx-kafka.properties && cat /tmp/ezx-php.ini"},
+					Environment: []string{"GREETING=Hello, EZX!"},
+					// pgBackRest-style pattern filter: strip config vars consumed into files
+					FilterEnvPattern: []string{"^POSTGRESQL_CONFIG_", "^KAFKA_CONFIG_"},
+					// MinIO-style exact filter: PHP_MEMORY_LIMIT was consumed into php.ini
+					FilterEnv:  []string{"PHP_MEMORY_LIMIT"},
+					WorkingDir: "/tmp",
 				},
 				Files: []domain.FileProvision{
 					{
