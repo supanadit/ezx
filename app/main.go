@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/viper"
 	"github.com/supanadit/ezx/domain"
@@ -78,8 +79,8 @@ func main() {
 				Name: "hello-world-parent-1",
 				Process: domain.Process{
 					BinaryPath:  "/bin/sh",
-					Arguments:   []string{"-c", "echo \"$GREETING\" && cat /tmp/ezx-pgbackrest.conf && cat /tmp/ezx-postgresql.conf"},
-					Environment: []string{"GREETING=Hello, EZX!", "NODE_ROLE=primary", "POSTGRESQL_CONFIG_SHARED_BUFFERS=128MB", "POSTGRESQL_CONFIG_MAX_CONNECTIONS=100"},
+					Arguments:   []string{"-c", "echo \"$GREETING\" && cat /tmp/ezx-pgbackrest.conf && cat /tmp/ezx-postgresql.conf && cat /tmp/ezx-kafka.properties && cat /tmp/ezx-php.ini"},
+					Environment: []string{"GREETING=Hello, EZX!", "NODE_ROLE=primary", "POSTGRESQL_CONFIG_SHARED_BUFFERS=128MB", "POSTGRESQL_CONFIG_MAX_CONNECTIONS=100", "KAFKA_CONFIG_LOG_RETENTION_MS=60000", "KAFKA_CONFIG_NUM_PARTITIONS=3", "PHP_MEMORY_LIMIT=4096M"},
 					WorkingDir:  "/tmp",
 				},
 				Files: []domain.FileProvision{
@@ -103,6 +104,30 @@ func main() {
 								Value:          "${name} = ${value}",
 								ValueFormat:    domain.ValueFormatAuto,
 							},
+						},
+					},
+					// Kafka properties: KAFKA_CONFIG_LOG_RETENTION_MS → log.retention.ms=60000
+					{
+						Path: "/tmp/ezx-kafka.properties",
+						Operations: []domain.FileOperation{
+							{
+								Type:           domain.FileOpSetProperty,
+								FromEnvPattern: "^KAFKA_CONFIG_(.+)$",
+								NameTransform:  domain.NameTransformSnakeToDot,
+								Pattern:        "^${name}=.*",
+								Value:          "${name}=${value}",
+							},
+						},
+					},
+					// ProcessFunc callback: php.ini memory_limit upsert with unit validation
+					{
+						Path: "/tmp/ezx-php.ini",
+						ProcessFunc: func(editor domain.FileEditor, environ []string) error {
+							limit := envValue(environ, "PHP_MEMORY_LIMIT")
+							if limit == "" {
+								return nil
+							}
+							return editor.Upsert("^[[:space:]]*memory_limit[[:space:]]*=", "memory_limit = "+limit)
 						},
 					},
 				},
@@ -134,4 +159,14 @@ func main() {
 		fmt.Println("❌ EZX failed:", err)
 	}
 	fmt.Println("✅ EZX started successfully!")
+}
+
+// envValue returns the value of an environment variable from a KEY=VALUE slice, or "".
+func envValue(environ []string, name string) string {
+	for _, kv := range environ {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == name {
+			return v
+		}
+	}
+	return ""
 }

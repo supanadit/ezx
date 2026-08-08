@@ -52,6 +52,31 @@ func provisionFile(fp domain.FileProvision) error {
 
 	baseTarget := expandEnvVars(fp.Path, nil)
 
+	// ProcessFunc takes full control of file processing.
+	if fp.ProcessFunc != nil {
+		editor := newFileEditor(baseTarget)
+		if err := fp.ProcessFunc(editor, os.Environ()); err != nil {
+			return err
+		}
+		return applyPermissionAndOwner(baseTarget, fp.Permission, fp.Owner)
+	}
+
+	// ContentFunc generates the entire file content.
+	if fp.ContentFunc != nil {
+		editor := newFileEditor(baseTarget)
+		content, err := fp.ContentFunc(editor, os.Environ())
+		if err != nil {
+			return err
+		}
+		if err := ensureParentDir(baseTarget); err != nil {
+			return err
+		}
+		if err := os.WriteFile(baseTarget, []byte(content), 0o644); err != nil {
+			return err
+		}
+		return applyPermissionAndOwner(baseTarget, fp.Permission, fp.Owner)
+	}
+
 	for _, op := range fp.Operations {
 		if !envConditionMet(op.When, os.Environ()) {
 			continue
@@ -67,16 +92,23 @@ func provisionFile(fp domain.FileProvision) error {
 	// For static paths (no per-source interpolation), apply Permission/Owner once.
 	// FileOpCopy with ${value} paths applies them per-file inside applyOperation.
 	if !strings.Contains(fp.Path, "${") {
-		target := baseTarget
-		if fp.Permission != 0 {
-			if err := os.Chmod(target, fp.Permission); err != nil {
-				return err
-			}
+		if err := applyPermissionAndOwner(baseTarget, fp.Permission, fp.Owner); err != nil {
+			return err
 		}
-		if fp.Owner != "" {
-			if err := chown(target, fp.Owner); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+// applyPermissionAndOwner sets the file permission and ownership if specified.
+func applyPermissionAndOwner(target string, permission os.FileMode, owner string) error {
+	if permission != 0 {
+		if err := os.Chmod(target, permission); err != nil {
+			return err
+		}
+	}
+	if owner != "" {
+		if err := chown(target, owner); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -138,7 +170,12 @@ func resolveSources(op domain.FileOperation) ([]envSource, error) {
 			if m == nil {
 				continue
 			}
-			nameTransform := applyNameTransform(m[1], op.NameTransform)
+			var nameTransform string
+			if op.NameTransformFunc != nil {
+				nameTransform = op.NameTransformFunc(m[1])
+			} else {
+				nameTransform = applyNameTransform(m[1], op.NameTransform)
+			}
 			sources = append(sources, envSource{
 				value:    value,
 				captures: m[1:],
@@ -163,7 +200,7 @@ func executeOperation(op domain.FileOperation, target string, src envSource) err
 	case domain.FileOpCopy:
 		return opCopy(op, target, src)
 	case domain.FileOpReplace:
-		return opReplace(target, src)
+		return opReplace(target, op, src)
 	case domain.FileOpAppend:
 		return opAppend(target, op, src)
 	case domain.FileOpRemove:
@@ -208,11 +245,22 @@ func expandEnvVars(s string, src *envSource) string {
 }
 
 // interpolate expands ${value}, ${name}, ${N} using the source, then ${VAR} from env.
+// Used for regex patterns (Pattern, BlockEnd, Marker) where no value formatting applies.
 func interpolate(s string, src envSource) string {
+	return interpolateFormatted(s, src, domain.ValueFormatRaw, nil)
+}
+
+// interpolateFormatted expands placeholders, applying ValueTransformFunc to the value
+// and ValueFormat to the ${value} substitution. Used for content templates.
+func interpolateFormatted(s string, src envSource, format domain.ValueFormat, transform domain.ValueTransformFunc) string {
 	s = interpolationPattern.ReplaceAllStringFunc(s, func(m string) string {
 		switch m {
 		case "${value}":
-			return src.value
+			v := src.value
+			if transform != nil {
+				v = transform(v)
+			}
+			return formatValue(v, format)
 		case "${name}":
 			return src.name
 		}
@@ -223,6 +271,20 @@ func interpolate(s string, src envSource) string {
 		return src.captures[idx-1]
 	})
 	return expandEnvVars(s, &src)
+}
+
+// resolveContent returns the effective output content for a content-producing operation:
+// the LineFunc output when set, otherwise the Value template interpolated with the
+// operation's ValueTransformFunc and ValueFormat applied to the value portion.
+func resolveContent(op domain.FileOperation, src envSource) string {
+	if op.LineFunc != nil {
+		value := src.value
+		if op.ValueTransformFunc != nil {
+			value = op.ValueTransformFunc(value)
+		}
+		return op.LineFunc(src.name, value)
+	}
+	return interpolateFormatted(op.Value, src, op.ValueFormat, op.ValueTransformFunc)
 }
 
 // formatValue applies ValueFormat to a value.
@@ -254,9 +316,28 @@ func applyNameTransform(name string, t domain.NameTransform) string {
 		return strings.ToLower(name)
 	case domain.NameTransformUpper:
 		return strings.ToUpper(name)
+	case domain.NameTransformSnakeToDot:
+		return strings.ReplaceAll(strings.ToLower(name), "_", ".")
+	case domain.NameTransformSnakeToCamel:
+		return snakeToCamel(name)
+	case domain.NameTransformSnakeToKebab:
+		return strings.ReplaceAll(strings.ToLower(name), "_", "-")
 	default:
 		return name
 	}
+}
+
+// snakeToCamel converts UPPER_SNAKE (or lower_snake) to camelCase:
+// SHARED_BUFFERS → sharedBuffers, already_camel → alreadyCamel.
+func snakeToCamel(name string) string {
+	lower := strings.ToLower(name)
+	parts := strings.Split(lower, "_")
+	for i := 1; i < len(parts); i++ {
+		if len(parts[i]) > 0 {
+			parts[i] = strings.ToUpper(parts[i][:1]) + parts[i][1:]
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 // envConditionMet reports whether an env condition is satisfied.
@@ -324,8 +405,8 @@ func readContent(path string) (string, error) {
 }
 
 // opReplace overwrites the entire file content.
-func opReplace(target string, src envSource) error {
-	content := interpolate(src.value, src)
+func opReplace(target string, op domain.FileOperation, src envSource) error {
+	content := interpolateFormatted(src.value, src, domain.ValueFormatRaw, op.ValueTransformFunc)
 	if err := ensureParentDir(target); err != nil {
 		return err
 	}
@@ -334,7 +415,7 @@ func opReplace(target string, src envSource) error {
 
 // opAppend appends interpolated value(s) to the file.
 func opAppend(target string, op domain.FileOperation, src envSource) error {
-	value := interpolate(op.Value, src)
+	value := resolveContent(op, src)
 	if value == "" && op.FromEnv == "" && op.FromEnvPattern == "" {
 		value = src.value
 	}
@@ -382,7 +463,7 @@ func opRemove(target string, op domain.FileOperation, src envSource) error {
 
 // opEnsure ensures an interpolated line exists; appends if not found.
 func opEnsure(target string, op domain.FileOperation, src envSource) error {
-	value := interpolate(op.Value, src)
+	value := resolveContent(op, src)
 	if value == "" {
 		return nil
 	}
@@ -405,7 +486,7 @@ func opSetProperty(target string, op domain.FileOperation, src envSource) error 
 	if err != nil {
 		return fmt.Errorf("invalid Pattern %q: %w", pattern, err)
 	}
-	value := interpolate(op.Value, src)
+	value := resolveContent(op, src)
 	if value == "" {
 		return nil
 	}
@@ -434,7 +515,7 @@ func opInsert(target string, op domain.FileOperation, src envSource, after bool)
 	if err != nil {
 		return fmt.Errorf("invalid Pattern %q: %w", pattern, err)
 	}
-	value := interpolate(op.Value, src)
+	value := resolveContent(op, src)
 	if value == "" {
 		return nil
 	}
@@ -487,7 +568,7 @@ func opReplaceBlock(target string, op domain.FileOperation, src envSource) error
 	if err != nil {
 		return fmt.Errorf("invalid Pattern %q: %w", startPattern, err)
 	}
-	value := interpolate(op.Value, src)
+	value := resolveContent(op, src)
 
 	loc := startRe.FindStringIndex(content)
 	if loc == nil {
@@ -541,7 +622,7 @@ func opSetBlock(target string, op domain.FileOperation, src envSource) error {
 	if err != nil {
 		return fmt.Errorf("invalid Pattern %q: %w", startPattern, err)
 	}
-	value := interpolate(op.Value, src)
+	value := resolveContent(op, src)
 	if value == "" {
 		return nil
 	}
