@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/spf13/viper"
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/envutil"
 	"github.com/supanadit/ezx/internal/repository/system"
 )
 
@@ -123,7 +123,7 @@ func main() {
 					{
 						Path: "/tmp/ezx-php.ini",
 						ProcessFunc: func(editor domain.FileEditor, environ []string) error {
-							limit := envValue(environ, "PHP_MEMORY_LIMIT")
+							limit := envutil.Get(environ, "PHP_MEMORY_LIMIT", "")
 							if limit == "" {
 								return nil
 							}
@@ -159,14 +159,4 @@ func main() {
 		fmt.Println("❌ EZX failed:", err)
 	}
 	fmt.Println("✅ EZX started successfully!")
-}
-
-// envValue returns the value of an environment variable from a KEY=VALUE slice, or "".
-func envValue(environ []string, name string) string {
-	for _, kv := range environ {
-		if k, v, ok := strings.Cut(kv, "="); ok && k == name {
-			return v
-		}
-	}
-	return ""
 }

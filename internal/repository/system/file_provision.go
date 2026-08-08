@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/envutil"
 )
 
 // envSource represents a resolved value source for an operation execution.
@@ -156,29 +157,22 @@ func applyOperation(op domain.FileOperation, target string, permission os.FileMo
 func resolveSources(op domain.FileOperation) ([]envSource, error) {
 	switch {
 	case op.FromEnvPattern != "":
-		re, err := regexp.Compile(op.FromEnvPattern)
+		matches, err := envutil.Enumerate(os.Environ(), op.FromEnvPattern)
 		if err != nil {
 			return nil, fmt.Errorf("invalid FromEnvPattern %q: %w", op.FromEnvPattern, err)
 		}
 		var sources []envSource
-		for _, kv := range os.Environ() {
-			name, value, ok := strings.Cut(kv, "=")
-			if !ok {
-				continue
-			}
-			m := re.FindStringSubmatch(name)
-			if m == nil {
-				continue
-			}
+		for _, m := range matches {
+			captured := m.Captures[1]
 			var nameTransform string
 			if op.NameTransformFunc != nil {
-				nameTransform = op.NameTransformFunc(m[1])
+				nameTransform = op.NameTransformFunc(captured)
 			} else {
-				nameTransform = applyNameTransform(m[1], op.NameTransform)
+				nameTransform = applyNameTransform(captured, op.NameTransform)
 			}
 			sources = append(sources, envSource{
-				value:    value,
-				captures: m[1:],
+				value:    m.Value,
+				captures: m.Captures[1:],
 				name:     nameTransform,
 			})
 		}
@@ -345,17 +339,10 @@ func envConditionMet(c domain.EnvCondition, environ []string) bool {
 	if c.Name == "" {
 		return true
 	}
-	for _, kv := range environ {
-		name, value, ok := strings.Cut(kv, "=")
-		if !ok || name != c.Name {
-			continue
-		}
-		if c.Value == "" {
-			return value != ""
-		}
-		return value == c.Value
+	if c.Value == "" {
+		return envutil.IsSet(environ, c.Name)
 	}
-	return false
+	return envutil.HasValue(environ, c.Name, c.Value)
 }
 
 // ensureParentDir creates the parent directory of path if it does not exist.

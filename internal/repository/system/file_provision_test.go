@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/envutil"
 )
 
 func read(t *testing.T, path string) string {
@@ -434,7 +435,7 @@ func TestProcessFuncConditionalRemove(t *testing.T) {
 	fp := domain.FileProvision{
 		Path: target,
 		ProcessFunc: func(editor domain.FileEditor, environ []string) error {
-			if envHasValue(environ, "REMOVE_SECRET", "true") {
+			if envutil.HasValue(environ, "REMOVE_SECRET", "true") {
 				return editor.Remove("^secret=")
 			}
 			return nil
@@ -448,15 +449,6 @@ func TestProcessFuncConditionalRemove(t *testing.T) {
 	if got != want {
 		t.Fatalf("content = %q, want %q", got, want)
 	}
-}
-
-func envHasValue(environ []string, name, value string) bool {
-	for _, kv := range environ {
-		if k, v, ok := strings.Cut(kv, "="); ok && k == name && v == value {
-			return true
-		}
-	}
-	return false
 }
 
 func TestFileEditorReadMerge(t *testing.T) {
