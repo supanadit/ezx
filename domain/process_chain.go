@@ -22,6 +22,21 @@ type ProcessNode struct {
 	// Shutdown controls graceful shutdown of this process (optional; nil means
 	// SIGTERM, 30s timeout, force-kill enabled).
 	Shutdown *ShutdownConfig
+	// Exec, when true, replaces the current process image (PID 1) with this
+	// node's process via syscall.Exec — the final, long-running entrypoint
+	// process (e.g. the postgres server) becomes PID 1 for native signal
+	// handling. It must be a leaf with no still-supervised siblings; the
+	// orchestrator returns an error otherwise. Mutually exclusive with Health.
+	Exec bool
+	// ForwardSignals lists the signal names to relay from ezx (PID 1) to this
+	// process's process group while it is supervised, e.g. ["SIGTERM",
+	// "SIGINT", "SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH"]. Empty means only
+	// the shutdown signal (from Shutdown) is sent on drain.
+	ForwardSignals []string
+	// Health, when set, starts a health/readiness HTTP server (e.g. /readyz)
+	// for the duration of this node's supervision, gated on Health.ReadyProbe.
+	// Mutually exclusive with Exec.
+	Health *HealthConfig
 	// Children is a slice of dependent child processes (recursive for unlimited depth).
 	Children []ProcessNode
 }

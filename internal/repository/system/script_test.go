@@ -3,6 +3,7 @@ package system
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,9 +25,9 @@ func buildTestEngine(t *testing.T) (*ScriptEngine, *bytes.Buffer) {
 	log := NewLogger()
 	log.SetOutput(&buf)
 	reg.Register("ezx", func() any {
-		return scriptmodules.NewEzxModule(log, func(node domain.ProcessNode) process.ProcessRepository {
-			return NewProcessRepository(node)
-		}, nil)
+		return scriptmodules.NewEzxModule(context.Background(), log, func(node domain.ProcessNode) process.ProcessRepository {
+			return NewProcessRepository(node, nil)
+		}, nil, nil)
 	})
 	return NewScriptEngine(reg), &buf
 }
@@ -68,6 +69,24 @@ func TestScriptEditorModule(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "memory_limit = 512M") {
 		t.Fatalf("file content = %q, want it to contain 'memory_limit = 512M'", string(data))
+	}
+}
+
+func TestScriptFSModule(t *testing.T) {
+	parent := t.TempDir()
+	sub := filepath.Join(parent, "subdir")
+	engine, _ := buildTestEngine(t)
+
+	src := fmt.Sprintf(`
+		const { fs } = require("ezx");
+		if (fs.exists(%q)) throw new Error("exists should be false");
+		fs.mkdirAll(%q, 0o755);
+		if (!fs.exists(%q)) throw new Error("exists should be true after mkdir");
+		const names = fs.readDir(%q);
+		if (names.length !== 1 || names[0] !== "subdir") throw new Error("readDir wrong: " + names.join(","));
+	`, sub, sub, sub, parent)
+	if err := engine.RunString(context.Background(), src); err != nil {
+		t.Fatalf("RunString: %v", err)
 	}
 }
 

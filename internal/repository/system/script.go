@@ -35,7 +35,7 @@ func (s *ScriptEngine) RunFile(ctx context.Context, path string) error {
 // registered host modules resolve via the goja_nodejs require registry.
 func (s *ScriptEngine) RunString(ctx context.Context, source string) error {
 	vm := goja.New()
-	vm.SetFieldNameMapper(goja.UncapFieldNameMapper())
+	vm.SetFieldNameMapper(newFieldNameMapper())
 
 	// Set up the require registry so require("ezx/...") resolves to the
 	// registered host modules.

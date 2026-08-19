@@ -18,6 +18,7 @@ type fakeProc struct {
 	name     string
 	mu       sync.Mutex
 	started  []string
+	start    bool
 	exitCode int
 	delay    time.Duration
 	startC   chan string
@@ -29,6 +30,13 @@ func newFakeProc(name string, exitCode int, startC chan string) *fakeProc {
 }
 
 func (f *fakeProc) Start(_ context.Context, _ []string, _ domain.LogConfig) error {
+	f.mu.Lock()
+	if f.start {
+		f.mu.Unlock()
+		return nil
+	}
+	f.start = true
+	f.mu.Unlock()
 	if f.startC != nil {
 		f.startC <- f.name
 	}
@@ -66,6 +74,7 @@ func newTestService(procs map[string]*fakeProc) *Service {
 			return procs[node.Name]
 		},
 		&fakeLogger{},
+		nil,
 	)
 }
 
@@ -106,11 +115,19 @@ func TestRunStartsNeedReadyChildAfterParent(t *testing.T) {
 }
 
 func TestRunRestartsOnFailure(t *testing.T) {
-	proc := newFakeProc("svc", 1, nil)
-	procs := map[string]*fakeProc{"svc": proc}
+	// The orchestrator builds a fresh handle per restart, so track how many
+	// handles it requests (initial + each restart) via the factory.
+	var mu sync.Mutex
+	handles := 0
 	svc := NewService(
-		func(node domain.ProcessNode) process.ProcessRepository { return procs[node.Name] },
+		func(node domain.ProcessNode) process.ProcessRepository {
+			mu.Lock()
+			handles++
+			mu.Unlock()
+			return newFakeProc(node.Name, 1, nil)
+		},
 		&fakeLogger{},
+		nil,
 	)
 
 	chain := domain.ProcessChain{
@@ -123,9 +140,84 @@ func TestRunRestartsOnFailure(t *testing.T) {
 	defer cancel()
 	_ = svc.Run(ctx, chain)
 
-	proc.mu.Lock()
-	defer proc.mu.Unlock()
-	if len(proc.started) < 2 {
-		t.Fatalf("started %d times, want at least 2 (initial + 1 restart)", len(proc.started))
+	mu.Lock()
+	defer mu.Unlock()
+	if handles < 2 {
+		t.Fatalf("handles requested %d times, want at least 2 (initial + 1 restart)", handles)
+	}
+}
+
+func TestExecNodeRejectsActiveSiblings(t *testing.T) {
+	// The orchestrator is sequential, so a prior root's supervise has returned
+	// (active=0) by the time an exec root runs. The guard is defensive: it must
+	// reject when any process is still being supervised. Simulate that state
+	// directly and assert the runNode path errors before exec'ing.
+	procs := map[string]*fakeProc{}
+	svc := newTestService(procs)
+	svc.beginActive() // pretend a sibling is still being supervised
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := svc.Run(ctx, domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "postgres",
+				Exec: true,
+				Process: domain.Process{
+					BinaryPath: "/bin/true",
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for exec node with active sibling, got nil")
+	}
+}
+
+func TestExecAndHealthConflict(t *testing.T) {
+	procs := map[string]*fakeProc{}
+	svc := newTestService(procs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := svc.Run(ctx, domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name:   "postgres",
+				Exec:   true,
+				Health: &domain.HealthConfig{},
+				Process: domain.Process{
+					BinaryPath: "/bin/true",
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for node with both Exec and Health, got nil")
+	}
+}
+
+func TestLoneLeafRootDefaultsToExecSupervisesOnHealth(t *testing.T) {
+	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 0, nil)}
+	svc := newTestService(procs)
+
+	// A lone leaf root with Health set must NOT exec — it stays supervised, so
+	// the handle is started. (Exec would replace the test process; testing the
+	// actual exec is done via the exec integration test.)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := svc.Run(ctx, domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{Name: "svc", Health: &domain.HealthConfig{}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("health lone leaf should be supervised, got error: %v", err)
+	}
+	procs["svc"].mu.Lock()
+	started := len(procs["svc"].started)
+	procs["svc"].mu.Unlock()
+	if started < 1 {
+		t.Fatalf("health lone leaf started %d times, want >=1 (supervised, not exec'd)", started)
 	}
 }

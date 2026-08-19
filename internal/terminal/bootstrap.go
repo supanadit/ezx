@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/logger"
 	"github.com/supanadit/ezx/orchestrator"
 	"github.com/supanadit/ezx/script"
@@ -21,6 +22,7 @@ type BootstrapHandler struct {
 	registry *script.Registry
 	engine   script.ScriptEngine
 	log      logger.Logger
+	health   domain.HealthService
 }
 
 // NewBootstrapHandler constructs the handler, registers the bootstrap
@@ -32,6 +34,7 @@ func NewBootstrapHandler(
 	registry *script.Registry,
 	engine script.ScriptEngine,
 	log logger.Logger,
+	health domain.HealthService,
 ) {
 	h := &BootstrapHandler{
 		proc:     proc,
@@ -39,6 +42,7 @@ func NewBootstrapHandler(
 		registry: registry,
 		engine:   engine,
 		log:      log,
+		health:   health,
 	}
 	rootCmd.AddCommand(h.bootstrapCmd())
 }
@@ -63,7 +67,7 @@ func (h *BootstrapHandler) run(cmd *cobra.Command, args []string) error {
 	path := args[0]
 
 	h.registry.Register("ezx", func() any {
-		return scriptmodules.NewEzxModule(h.log, h.proc, h.orch)
+		return scriptmodules.NewEzxModule(cmd.Context(), h.log, h.proc, h.orch, h.health)
 	})
 
 	fmt.Printf("🚀 EZX bootstrapping %s\n", path)

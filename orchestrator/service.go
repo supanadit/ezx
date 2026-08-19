@@ -7,7 +7,9 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,33 +25,71 @@ type ProcessFactory func(node domain.ProcessNode) process.ProcessRepository
 
 // Service is the supervisor. It composes the module Ports to run a ProcessChain.
 type Service struct {
-	proc ProcessFactory
-	log  logger.Logger
+	proc   ProcessFactory
+	log    logger.Logger
+	health domain.HealthService
+
+	mu     sync.Mutex
+	active int
 }
 
-// NewService builds a supervisor from the injected Ports.
+// NewService builds a supervisor from the injected Ports. health is optional
+// (nil means health/readiness is not surfaced to the delivery layer).
 func NewService(
 	proc ProcessFactory,
 	log logger.Logger,
+	health domain.HealthService,
 ) *Service {
 	return &Service{
-		proc: proc,
-		log:  log,
+		proc:   proc,
+		log:    log,
+		health: health,
 	}
 }
 
 // Run executes every root in the chain and supervises the full dependency tree.
 func (s *Service) Run(ctx context.Context, chain domain.ProcessChain) error {
+	// A lone leaf root with no restart policy and no health config defaults to
+	// exec: the real service replaces ezx and becomes PID 1 (the common
+	// single-process container case). Multi-root, non-leaf, restart, or health
+	// nodes stay supervised.
+	execDefault := len(chain.Roots) == 1 &&
+		len(chain.Roots[0].Children) == 0 &&
+		chain.Roots[0].Restart == nil
 	for _, root := range chain.Roots {
-		if err := s.runNode(ctx, root); err != nil {
+		if err := s.runNode(ctx, root, execDefault); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// runNode drives a single ProcessNode through its lifecycle.
-func (s *Service) runNode(ctx context.Context, node domain.ProcessNode) error {
+// beginActive records that a supervised process is starting.
+func (s *Service) beginActive() {
+	s.mu.Lock()
+	s.active++
+	s.mu.Unlock()
+}
+
+// endActive records that a supervised process has finished.
+func (s *Service) endActive() {
+	s.mu.Lock()
+	if s.active > 0 {
+		s.active--
+	}
+	s.mu.Unlock()
+}
+
+// hasActiveSiblings reports whether any supervised process is still running.
+func (s *Service) hasActiveSiblings() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active > 0
+}
+
+// runNode drives a single ProcessNode through its lifecycle. execDefault is
+// true when this node is a lone leaf root that should exec by default.
+func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefault bool) error {
 	// Start children that do NOT require parent readiness first (parallel with
 	// the parent), mirroring the original Execute ordering.
 	if err := s.runChildren(ctx, node, false); err != nil {
@@ -72,8 +112,28 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode) error {
 	}
 	node.Process.Arguments = args
 
+	// exec and Health are mutually exclusive: exec replaces PID 1 (ezx
+	// vanishes), health requires ezx to stay alive. execDefault makes a lone
+	// leaf root exec unless it opts into supervision via Health.
+	execNode := node.Exec || (execDefault && node.Health == nil)
+	if node.Exec && node.Health != nil {
+		return fmt.Errorf("node %q cannot have both Exec and Health set", node.Name)
+	}
+
+	// An Exec node replaces PID 1 with its process; ezx disappears, so there
+	// must be no still-supervised siblings.
+	if execNode {
+		if s.hasActiveSiblings() {
+			return fmt.Errorf("exec node %q cannot have active siblings being supervised", node.Name)
+		}
+		s.log.Info("[%s] exec'ing to become PID 1", node.Name)
+		return repository.Exec(node.Process, env)
+	}
+
 	proc := s.proc(node)
 	s.log.Info("[%s] starting lifecycle", node.Name)
+	s.beginActive()
+	defer s.endActive()
 
 	lc := domain.LogConfig{Stdout: domain.LogDestStdout, Stderr: domain.LogDestStderr}
 	if node.Process.Log != nil {
@@ -86,6 +146,36 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode) error {
 	}
 	s.log.Info("[%s] started (pid=%d)", node.Name, proc.PID())
 
+	// Relay selected signals from ezx (PID 1) to the child process group.
+	var fwd *repository.Forwarder
+	if len(node.ForwardSignals) > 0 {
+		sigs, ferr := repository.ResolveForwardSignals(node.ForwardSignals)
+		if ferr != nil {
+			s.log.Error("[%s] invalid forward signal: %v", node.Name, ferr)
+			return ferr
+		}
+		fwd = repository.NewForwarder(proc.PID(), sigs)
+		fwd.Start(ctx)
+		s.log.Info("[%s] forwarding signals %v to pgid %d", node.Name, node.ForwardSignals, proc.PID())
+		defer fwd.Stop()
+	}
+
+	// Drive readiness for the node's lifetime: reset it, then poll the node's
+	// probe (Health.ReadyProbe, falling back to Readiness) and report the
+	// result on the injected health service so /readyz reflects it.
+	var pollCancel context.CancelFunc
+	if node.Health != nil && s.health != nil {
+		s.health.SetReady(false)
+		probe := node.Health.ReadyProbe
+		if probe == nil {
+			probe = node.Readiness
+		}
+		var pollCtx context.Context
+		pollCtx, pollCancel = context.WithCancel(ctx)
+		go s.pollReadiness(pollCtx, probe)
+		defer pollCancel()
+	}
+
 	// Wait for readiness before exposing to children that need it.
 	if node.Readiness != nil {
 		s.log.Info("[%s] waiting for readiness", node.Name)
@@ -95,6 +185,9 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode) error {
 		}
 		if !ready {
 			s.log.Error("[%s] never became ready", node.Name)
+		}
+		if node.Health != nil && s.health != nil {
+			s.health.SetReady(ready)
 		}
 	}
 
@@ -110,12 +203,36 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode) error {
 func (s *Service) runChildren(ctx context.Context, node domain.ProcessNode, needReady bool) error {
 	for _, child := range node.Children {
 		if child.NeedParentReady == needReady {
-			if err := s.runNode(ctx, child); err != nil {
+			if err := s.runNode(ctx, child, false); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// pollReadiness polls the probe and reports readiness on the health service
+// until ctx is cancelled or the probe is nil.
+func (s *Service) pollReadiness(ctx context.Context, probe *domain.Probe) {
+	if probe == nil {
+		return
+	}
+	interval := probe.Interval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+		ready, err := repository.Check(ctx, *probe)
+		if err != nil {
+			s.log.Warn("health probe error: %v", err)
+		}
+		s.health.SetReady(ready)
+	}
 }
 
 // supervise waits for the process, applying the restart policy and handling
@@ -159,6 +276,9 @@ func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc p
 				return ctx.Err()
 			case <-time.After(backoff):
 			}
+			// Build a fresh handle: a ProcessRepository is single-use (its Start
+			// is idempotent), so restarting requires a new one per attempt.
+			proc = s.proc(node)
 			if err := proc.Start(ctx, os.Environ(), s.logConfig(node)); err != nil {
 				return err
 			}

@@ -5,13 +5,14 @@ import (
 	"testing"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository"
 )
 
 func TestBuildProcessEnvNoFilter(t *testing.T) {
 	parent := []string{"PATH=/usr/bin", "HOME=/root"}
-	env, err := buildProcessEnv(parent, domain.Process{})
+	env, err := repository.BuildProcessEnv(parent, domain.Process{})
 	if err != nil {
-		t.Fatalf("buildProcessEnv: %v", err)
+		t.Fatalf("repository.BuildProcessEnv: %v", err)
 	}
 	if !reflect.DeepEqual(env, parent) {
 		t.Fatalf("env = %v, want parent unchanged %v", env, parent)
@@ -20,11 +21,11 @@ func TestBuildProcessEnvNoFilter(t *testing.T) {
 
 func TestBuildProcessEnvExactFilter(t *testing.T) {
 	parent := []string{"ETCD_NAME=n1", "ETCD_DATA_DIR=/data", "PATH=/usr/bin"}
-	env, err := buildProcessEnv(parent, domain.Process{
+	env, err := repository.BuildProcessEnv(parent, domain.Process{
 		FilterEnv: []string{"ETCD_NAME", "ETCD_DATA_DIR"},
 	})
 	if err != nil {
-		t.Fatalf("buildProcessEnv: %v", err)
+		t.Fatalf("repository.BuildProcessEnv: %v", err)
 	}
 	want := []string{"PATH=/usr/bin"}
 	if !reflect.DeepEqual(env, want) {
@@ -38,11 +39,11 @@ func TestBuildProcessEnvPatternFilter(t *testing.T) {
 		"PGBACKREST_STANZA=main",
 		"POSTGRESQL_DB=app",
 	}
-	env, err := buildProcessEnv(parent, domain.Process{
+	env, err := repository.BuildProcessEnv(parent, domain.Process{
 		FilterEnvPattern: []string{"^PGBACKREST_"},
 	})
 	if err != nil {
-		t.Fatalf("buildProcessEnv: %v", err)
+		t.Fatalf("repository.BuildProcessEnv: %v", err)
 	}
 	want := []string{"POSTGRESQL_DB=app"}
 	if !reflect.DeepEqual(env, want) {
@@ -57,11 +58,11 @@ func TestBuildProcessEnvMinIOSelective(t *testing.T) {
 		"MINIO_ROOT_USER=admin",
 		"MINIO_ROOT_PASSWORD=secret",
 	}
-	env, err := buildProcessEnv(parent, domain.Process{
+	env, err := repository.BuildProcessEnv(parent, domain.Process{
 		FilterEnv: []string{"MINIO_DATA_DIR", "MINIO_ADDRESS"},
 	})
 	if err != nil {
-		t.Fatalf("buildProcessEnv: %v", err)
+		t.Fatalf("repository.BuildProcessEnv: %v", err)
 	}
 	want := []string{"MINIO_ROOT_USER=admin", "MINIO_ROOT_PASSWORD=secret"}
 	if !reflect.DeepEqual(env, want) {
@@ -71,12 +72,12 @@ func TestBuildProcessEnvMinIOSelective(t *testing.T) {
 
 func TestBuildProcessEnvAdditionsOverrideFilter(t *testing.T) {
 	parent := []string{"PGBACKREST_STANZA=main"}
-	env, err := buildProcessEnv(parent, domain.Process{
+	env, err := repository.BuildProcessEnv(parent, domain.Process{
 		FilterEnvPattern: []string{"^PGBACKREST_"},
 		Environment:      []string{"PGBACKREST_STANZA=forced"},
 	})
 	if err != nil {
-		t.Fatalf("buildProcessEnv: %v", err)
+		t.Fatalf("repository.BuildProcessEnv: %v", err)
 	}
 	want := []string{"PGBACKREST_STANZA=forced"}
 	if !reflect.DeepEqual(env, want) {
@@ -85,9 +86,9 @@ func TestBuildProcessEnvAdditionsOverrideFilter(t *testing.T) {
 }
 
 func TestBuildProcessEnvInvalidPattern(t *testing.T) {
-	if _, err := buildProcessEnv([]string{"A=1"}, domain.Process{
+	if _, err := repository.BuildProcessEnv([]string{"A=1"}, domain.Process{
 		FilterEnvPattern: []string{"("},
 	}); err == nil {
-		t.Fatal("buildProcessEnv with invalid pattern should return error")
+		t.Fatal("repository.BuildProcessEnv with invalid pattern should return error")
 	}
 }

@@ -35,6 +35,13 @@ type Process struct {
 	FilterEnvPattern []string
 	// WorkingDir is the optional working directory (optional; empty string means use current directory).
 	WorkingDir string
+	// User is the user the process should run as: a name (e.g. "postgres") or a
+	// numeric UID. Empty means inherit the parent process's user (the default).
+	// Resolved to a syscall credential at spawn time.
+	User string
+	// Group is the group the process should run as: a name or numeric GID.
+	// Empty means use the resolved user's primary group.
+	Group string
 	// Log controls how the process's stdout/stderr are routed (optional; nil means
 	// inherit the parent's stdout/stderr).
 	Log *LogConfig

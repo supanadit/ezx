@@ -14,18 +14,22 @@ import (
 // started. It does not perform any tree-walk or lifecycle orchestration — that
 // is the orchestrator's responsibility.
 type ProcessRepository struct {
-	node  domain.ProcessNode
-	cmd   *exec.Cmd
-	done  chan struct{}
-	start bool
+	node   domain.ProcessNode
+	cmd    *exec.Cmd
+	done   chan struct{}
+	start  bool
+	reaper *Reaper
+	code   int
 }
 
-// NewProcessRepository creates a handle for the given ProcessNode. It has not
-// been started yet.
-func NewProcessRepository(node domain.ProcessNode) *ProcessRepository {
+// NewProcessRepository creates a handle for the given ProcessNode, reaping its
+// exit through the shared reaper (nil disables reaper-based waiting and falls
+// back to local cmd.Wait). It has not been started yet.
+func NewProcessRepository(node domain.ProcessNode, reaper *Reaper) *ProcessRepository {
 	return &ProcessRepository{
-		node: node,
-		done: make(chan struct{}),
+		node:   node,
+		done:   make(chan struct{}),
+		reaper: reaper,
 	}
 }
 
@@ -39,7 +43,7 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	}
 	s.start = true
 
-	procEnv, err := buildProcessEnv(env, s.node.Process)
+	procEnv, err := repository.BuildProcessEnv(env, s.node.Process)
 	if err != nil {
 		return err
 	}
@@ -47,6 +51,10 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	cmd := exec.CommandContext(ctx, s.node.Process.BinaryPath, s.node.Process.Arguments...)
 	cmd.Env = procEnv
 	cmd.Dir = s.node.Process.WorkingDir
+	if err := repository.ApplyCredential(cmd, s.node.Process); err != nil {
+		return err
+	}
+	repository.SetProcessGroupLeader(cmd)
 
 	switch lc.Stdout {
 	case domain.LogDestDiscard:
@@ -69,10 +77,23 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	}
 	s.cmd = cmd
 
-	go func() {
-		_ = cmd.Wait()
-		close(s.done)
-	}()
+	// Reap through the shared reaper when available (avoids racing wait4);
+	// otherwise fall back to a local cmd.Wait goroutine.
+	if s.reaper != nil {
+		ch := s.reaper.Register(cmd.Process.Pid)
+		go func() {
+			exit, ok := <-ch
+			if ok {
+				s.code = exit.code
+			}
+			close(s.done)
+		}()
+	} else {
+		go func() {
+			_ = cmd.Wait()
+			close(s.done)
+		}()
+	}
 
 	return nil
 }
@@ -83,8 +104,10 @@ func (s *ProcessRepository) Wait() (int, error) {
 	if s.cmd == nil {
 		return -1, nil
 	}
-	code := s.cmd.ProcessState.ExitCode()
-	return code, nil
+	if s.code != 0 {
+		return s.code, nil
+	}
+	return s.cmd.ProcessState.ExitCode(), nil
 }
 
 // Signal sends a signal to the process.
@@ -114,16 +137,4 @@ func (s *ProcessRepository) PID() int {
 // Done closes when the process exits.
 func (s *ProcessRepository) Done() <-chan struct{} {
 	return s.done
-}
-
-// buildProcessEnv assembles the environment for a spawned process: the parent
-// environment filtered by the process's FilterEnv/FilterEnvPattern, with the
-// process's additive Environment entries appended last so they override any
-// inherited or filtered values.
-func buildProcessEnv(parentEnv []string, p domain.Process) ([]string, error) {
-	base, err := repository.Filter(parentEnv, p.FilterEnv, p.FilterEnvPattern)
-	if err != nil {
-		return nil, err
-	}
-	return append(base, p.Environment...), nil
 }

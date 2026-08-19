@@ -6,6 +6,7 @@ import (
 	"syscall"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository"
 	"github.com/supanadit/ezx/process"
 )
 
@@ -14,31 +15,43 @@ import (
 type ProcessFactory func(node domain.ProcessNode) process.ProcessRepository
 
 // ProcessModule exposes ezx.process: spawn(opts) starts a process from a JS
-// object and returns a handle with wait/signal/kill/pid/done.
+// object and returns a handle with wait/signal/kill/pid/done. It carries the
+// script's cancellation context so spawned processes are interrupted when the
+// app shuts down (e.g. SIGTERM).
 type ProcessModule struct {
+	ctx     context.Context
 	factory ProcessFactory
 }
 
-// NewProcessModule returns a ProcessModule backed by the given factory.
-func NewProcessModule(factory ProcessFactory) *ProcessModule {
-	return &ProcessModule{factory: factory}
+// NewProcessModule returns a ProcessModule backed by the given factory,
+// interrupting spawned processes when ctx is cancelled.
+func NewProcessModule(ctx context.Context, factory ProcessFactory) *ProcessModule {
+	return &ProcessModule{ctx: ctx, factory: factory}
 }
 
 // Spawn launches a process from a JS options object (binary, args, env,
 // workingDir) and returns a script-visible process handle.
 func (m *ProcessModule) Spawn(node domain.ProcessNode) *ProcessHandle {
 	repo := m.factory(node)
-	return &ProcessHandle{repo: repo}
+	return &ProcessHandle{ctx: m.ctx, repo: repo}
 }
 
 // ProcessHandle wraps a process.ProcessRepository as the script-visible handle.
 type ProcessHandle struct {
+	ctx  context.Context
 	repo process.ProcessRepository
+}
+
+// Exec replaces the current process image (PID 1) with the given process via
+// syscall.Exec. This is the final, long-running entrypoint process (e.g. the
+// postgres server). It never returns on success.
+func (m *ProcessModule) Exec(node domain.ProcessNode) error {
+	return repository.Exec(node.Process, os.Environ())
 }
 
 // Start launches the process (idempotent).
 func (h *ProcessHandle) Start(env []string) error {
-	return h.repo.Start(context.Background(), env, domain.LogConfig{
+	return h.repo.Start(h.ctx, env, domain.LogConfig{
 		Stdout: domain.LogDestStdout,
 		Stderr: domain.LogDestStderr,
 	})
