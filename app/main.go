@@ -8,200 +8,75 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/internal/repository"
 	"github.com/supanadit/ezx/internal/repository/system"
 	"github.com/supanadit/ezx/orchestrator"
 	"github.com/supanadit/ezx/process"
+	"github.com/supanadit/ezx/script"
+	scriptmodules "github.com/supanadit/ezx/script/modules"
 )
 
 func main() {
-	fmt.Println("🚀 Starting EZX....")
 	home, err := os.UserHomeDir()
 	if err != nil {
 		panic("You must have a home directory set for ezx to work")
 	}
 
 	ezxHomeDir := filepath.Join(home, ".ezx")
-	ezxToolDir := filepath.Join(ezxHomeDir, "tools")
-	ezxSandboxDir := filepath.Join(ezxHomeDir, "sandbox")
-
 	viper.Set("EZX_DIR_HOME", ezxHomeDir)
-	viper.SetDefault("EZX_DIR_TOOLS", ezxToolDir)
-	viper.SetDefault("EZX_DIR_SANDBOX", ezxSandboxDir)
+	viper.SetDefault("EZX_DIR_TOOLS", filepath.Join(ezxHomeDir, "tools"))
+	viper.SetDefault("EZX_DIR_SANDBOX", filepath.Join(ezxHomeDir, "sandbox"))
 
-	// Dummy example of ProcessChain
-	chain := domain.ProcessChain{
-		Roots: []domain.ProcessNode{
-			{
-				Name: "postgresql",
-				Process: domain.Process{
-					BinaryPath:  "/usr/bin/postgres",
-					Arguments:   []string{"-D", "/var/lib/postgresql/data"},
-					Environment: []string{"PGDATA=/var/lib/postgresql/data"},
-					WorkingDir:  "/var/lib/postgresql",
-				},
-				Children: []domain.ProcessNode{
-					{
-						Name: "pgbouncer",
-						Process: domain.Process{
-							BinaryPath: "/usr/bin/pgbouncer",
-							Arguments:  []string{"/etc/pgbouncer/pgbouncer.ini"},
-							WorkingDir: "/etc/pgbouncer",
-						},
-						NeedParentReady: true,
-						Children: []domain.ProcessNode{
-							{
-								Name: "pgpool",
-								Process: domain.Process{
-									BinaryPath: "/usr/bin/pgpool",
-									Arguments:  []string{"-n"},
-									WorkingDir: "/etc/pgpool",
-								},
-								NeedParentReady: true,
-							},
-						},
-					},
-					{
-						Name: "etcd",
-						Process: domain.Process{
-							BinaryPath: "/usr/bin/etcd",
-							Arguments:  []string{"--data-dir=/var/lib/etcd"},
-							WorkingDir: "/var/lib/etcd",
-						},
-					},
-				},
-			},
-		},
+	if len(os.Args) < 2 {
+		fmt.Println("usage: ezx bootstrap <script.js>")
+		os.Exit(1)
 	}
-	_ = chain // Avoid unused variable error
+	cmd := os.Args[1]
+	switch cmd {
+	case "bootstrap":
+		if len(os.Args) < 3 {
+			fmt.Println("usage: ezx bootstrap <script.js>")
+			os.Exit(1)
+		}
+		bootstrap(os.Args[2])
+	default:
+		fmt.Printf("unknown command %q\n", cmd)
+		fmt.Println("usage: ezx bootstrap <script.js>")
+		os.Exit(1)
+	}
+}
 
-	chainSample := domain.ProcessChain{
-		Roots: []domain.ProcessNode{
-			{
-				Name: "hello-world-parent-1",
-				Process: domain.Process{
-					BinaryPath:  "/bin/sh",
-					Arguments:   []string{"-c", "echo \"GREETING=$GREETING\" && echo \"NODE_ROLE=${NODE_ROLE:-UNSET}\" && echo \"PG_SHARED_BUFFERS=${POSTGRESQL_CONFIG_SHARED_BUFFERS:-FILTERED}\" && echo \"KAFKA_RETENTION=${KAFKA_CONFIG_LOG_RETENTION_MS:-FILTERED}\" && echo \"PHP_MEMORY_LIMIT=${PHP_MEMORY_LIMIT:-FILTERED}\" && cat /tmp/ezx-pgbackrest.conf && cat /tmp/ezx-postgresql.conf && cat /tmp/ezx-kafka.properties && cat /tmp/ezx-php.ini"},
-					Environment: []string{"GREETING=Hello, EZX!"},
-					// pgBackRest-style pattern filter: strip config vars consumed into files
-					FilterEnvPattern: []string{"^POSTGRESQL_CONFIG_", "^KAFKA_CONFIG_"},
-					// MinIO-style exact filter: PHP_MEMORY_LIMIT was consumed into php.ini
-					FilterEnv:  []string{"PHP_MEMORY_LIMIT"},
-					WorkingDir: "/tmp",
-				},
-				Files: []domain.FileProvision{
-					{
-						Path:       "/tmp/ezx-pgbackrest.conf",
-						Permission: 0640,
-						When:       domain.EnvCondition{Name: "NODE_ROLE", Value: "primary"},
-						Operations: []domain.FileOperation{
-							{Type: domain.FileOpRemove, Pattern: "^pg2-"},
-							{Type: domain.FileOpSetProperty, Pattern: "^backup-standby=", Value: "backup-standby=n"},
-						},
-					},
-					{
-						Path: "/tmp/ezx-postgresql.conf",
-						Operations: []domain.FileOperation{
-							{
-								Type:           domain.FileOpSetProperty,
-								FromEnvPattern: "^POSTGRESQL_CONFIG_(.+)$",
-								NameTransform:  domain.NameTransformLower,
-								Pattern:        "^[[:space:]]*#?[[:space:]]*${name}[[:space:]]*=.*",
-								Value:          "${name} = ${value}",
-								ValueFormat:    domain.ValueFormatAuto,
-							},
-						},
-					},
-					// Kafka properties: KAFKA_CONFIG_LOG_RETENTION_MS → log.retention.ms=60000
-					{
-						Path: "/tmp/ezx-kafka.properties",
-						Operations: []domain.FileOperation{
-							{
-								Type:           domain.FileOpSetProperty,
-								FromEnvPattern: "^KAFKA_CONFIG_(.+)$",
-								NameTransform:  domain.NameTransformSnakeToDot,
-								Pattern:        "^${name}=.*",
-								Value:          "${name}=${value}",
-							},
-						},
-					},
-					// ProcessFunc callback: php.ini memory_limit upsert with unit validation
-					{
-						Path: "/tmp/ezx-php.ini",
-						ProcessFunc: func(editor domain.FileEditor, environ []string) error {
-							limit := repository.Get(environ, "PHP_MEMORY_LIMIT", "")
-							if limit == "" {
-								return nil
-							}
-							return editor.Upsert("^[[:space:]]*memory_limit[[:space:]]*=", "memory_limit = "+limit)
-						},
-					},
-				},
-				Children: []domain.ProcessNode{
-					{
-						Name: "prometheus-demo",
-						Process: domain.Process{
-							BinaryPath: "/bin/sh",
-							// Static base args with ${VAR:-default} interpolation (Pattern 1)
-							Arguments: []string{"-c", "echo \"PROMETHEUS ARGS: $@\"", "prometheus"},
-							// Declarative env-to-arguments (ArgOperations)
-							ArgOperations: []domain.ArgOperation{
-								// if-set value (Pattern 2): only when PROMETHEUS_WEB_CONFIG_FILE is set
-								{Flag: "--web.config.file", FromEnv: "PROMETHEUS_WEB_CONFIG_FILE"},
-								// if-truthy bare flag (Pattern 3)
-								{When: domain.EnvCondition{Name: "PROMETHEUS_ENABLE_WEB_LIFECYCLE", Value: "true"}, Flag: "--web.enable-lifecycle", Format: domain.ArgFormatBareFlag},
-								// if-truthy feature (Pattern 5): literal value mapped from env
-								{When: domain.EnvCondition{Name: "PROMETHEUS_ENABLE_NATIVE_HISTOGRAM", Value: "true"}, Flag: "--enable-feature", Value: "native-histograms"},
-								// comma-split list (Pattern 6)
-								{Flag: "--endpoint", FromEnv: "THANOS_QUERY_STORE_ADDRESSES", Split: ","},
-								// pattern-enum with name transform (Pattern 7+10)
-								{Flag: "--label", FromEnvPattern: "^THANOS_RECEIVE_LABELS_(.+)$", Value: `${name}="${value}"`, NameTransform: domain.NameTransformLower},
-								// whitespace-split pass-through (Pattern 8)
-								{FromEnv: "THANOS_EXTRA_ARGS", Split: " ", Format: domain.ArgFormatRaw},
-							},
-							WorkingDir: "/tmp",
-						},
-						NeedParentReady: true,
-					},
-					{
-						Name: "hello-world-child-2",
-						Process: domain.Process{
-							BinaryPath: "/bin/sh",
-							Arguments:  []string{"-c", "echo \"Hello World from child 2!\""},
-							WorkingDir: "/tmp",
-						},
-						NeedParentReady: false,
-					},
-					{
-						Name: "hello-world-child-1",
-						Process: domain.Process{
-							BinaryPath: "/bin/sh",
-							Arguments:  []string{"-c", "echo \"Hello World from child 1!\""},
-							WorkingDir: "/tmp",
-						},
-						NeedParentReady: true,
-					},
-				},
-			},
-		},
-	}
-	// Compose the supervisor: wire the process adapter and logger into the
-	// orchestrator. File/arg provisioning and probes are handled by the
-	// internal/repository helpers.
+// bootstrap runs a user-supplied JavaScript entrypoint script against the ezx
+// host API (require("ezx")). It composes the process adapter, orchestrator,
+// logger, and registers the host modules.
+func bootstrap(path string) {
 	log := system.NewLogger()
-	svc := orchestrator.NewService(
+
+	// Compose the supervisor used by the optional ezx.chain helper.
+	orch := orchestrator.NewService(
 		func(node domain.ProcessNode) process.ProcessRepository {
 			return system.NewProcessRepository(node)
 		},
 		log,
 	)
+	procFactory := func(node domain.ProcessNode) process.ProcessRepository {
+		return system.NewProcessRepository(node)
+	}
 
-	// Run the chainSample under the supervisor. The roots run in a goroutine so
-	// a context cancel (e.g. SIGTERM/SIGINT) triggers graceful drain.
+	// Register the aggregate host module exposed to scripts via require("ezx").
+	registry := script.NewRegistry()
+	registry.Register("ezx", func() any {
+		return scriptmodules.NewEzxModule(log, procFactory, orch)
+	})
+
+	engine := system.NewScriptEngine(registry)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := svc.Run(ctx, chainSample); err != nil {
+
+	fmt.Printf("🚀 EZX bootstrapping %s\n", path)
+	if err := engine.RunFile(ctx, path); err != nil {
 		fmt.Println("❌ EZX failed:", err)
+		os.Exit(1)
 	}
-	fmt.Println("✅ EZX started successfully!")
+	fmt.Println("✅ EZX bootstrap complete")
 }

@@ -50,9 +50,6 @@ func (s *Service) Run(ctx context.Context, chain domain.ProcessChain) error {
 
 // runNode drives a single ProcessNode through its lifecycle.
 func (s *Service) runNode(ctx context.Context, node domain.ProcessNode) error {
-	proc := s.proc(node)
-	s.log.Info("[%s] starting lifecycle", node.Name)
-
 	// Start children that do NOT require parent readiness first (parallel with
 	// the parent), mirroring the original Execute ordering.
 	if err := s.runChildren(ctx, node, false); err != nil {
@@ -65,7 +62,8 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode) error {
 		return err
 	}
 
-	// Build arguments from the process environment.
+	// Build arguments from the process environment, then create the handle so
+	// the enriched arguments reach the spawned process.
 	env := os.Environ()
 	args, err := repository.BuildArgs(node.Process, env)
 	if err != nil {
@@ -73,6 +71,9 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode) error {
 		return err
 	}
 	node.Process.Arguments = args
+
+	proc := s.proc(node)
+	s.log.Info("[%s] starting lifecycle", node.Name)
 
 	lc := domain.LogConfig{Stdout: domain.LogDestStdout, Stderr: domain.LogDestStderr}
 	if node.Process.Log != nil {

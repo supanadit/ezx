@@ -787,6 +787,13 @@ type fileEditor struct {
 	target string
 }
 
+// OpenFileEditor returns a FileEditor bound to the given target path. It lets
+// host modules (e.g. the ezx.editor script module) expose the file-editing
+// surface to scripts.
+func OpenFileEditor(target string) domain.FileEditor {
+	return newFileEditor(target)
+}
+
 // newFileEditor returns a FileEditor bound to the given target path.
 func newFileEditor(target string) domain.FileEditor {
 	return &fileEditor{target: target}
