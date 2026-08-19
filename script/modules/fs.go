@@ -77,6 +77,31 @@ func (m *FSModule) RemoveAll(path string) error {
 	return repository.RemoveAll(path)
 }
 
+// Symlink creates a symbolic link named newpath pointing to target.
+func (m *FSModule) Symlink(target, newpath string) error {
+	return repository.Symlink(target, newpath)
+}
+
+// Realpath resolves symlinks and returns the canonical absolute path.
+func (m *FSModule) Realpath(path string) (string, error) {
+	return repository.Realpath(path)
+}
+
+// TempFile creates a temporary file with the given pattern (dir optional).
+func (m *FSModule) TempFile(dir, pattern string) (string, error) {
+	return repository.TempFile(dir, pattern)
+}
+
+// TempDir creates a temporary directory with the given pattern (dir optional).
+func (m *FSModule) TempDir(dir, pattern string) (string, error) {
+	return repository.TempDir(dir, pattern)
+}
+
+// Umask sets the process umask and returns the previous umask.
+func (m *FSModule) Umask(mask int) int {
+	return repository.Umask(mask)
+}
+
 // Rename renames (or moves) a path.
 func (m *FSModule) Rename(oldPath, newPath string) error {
 	return repository.Rename(oldPath, newPath)

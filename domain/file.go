@@ -38,6 +38,11 @@ type FileProvision struct {
 	// When is an optional env-var condition that gates whether this provision applies.
 	// If empty, the provision always applies.
 	When EnvCondition
+	// CreateOnly, when true, skips the provision if the target file already
+	// exists. Useful for generating default configs without clobbering
+	// user-provided files (the `if [ ! -f "$file" ]` guard from entrypoint
+	// scripts).
+	CreateOnly bool
 }
 
 // FileOperation represents a single transformation applied to a text file.

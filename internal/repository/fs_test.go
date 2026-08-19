@@ -122,3 +122,42 @@ func TestChownRecursive(t *testing.T) {
 		t.Fatalf("ChownRecursive: %v", err)
 	}
 }
+
+func TestSymlinkTempUmask(t *testing.T) {
+	dir := t.TempDir()
+
+	target := filepath.Join(dir, "target.txt")
+	link := filepath.Join(dir, "link.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link is not a symlink: %v", err)
+	}
+	resolved, err := Realpath(link)
+	if err != nil {
+		t.Fatalf("Realpath: %v", err)
+	}
+	if resolved != target {
+		t.Fatalf("Realpath = %q, want %q", resolved, target)
+	}
+
+	tf, err := TempFile(dir, "ezx-*.txt")
+	if err != nil {
+		t.Fatalf("TempFile: %v", err)
+	}
+	if !Exists(tf) {
+		t.Fatalf("temp file %q does not exist", tf)
+	}
+
+	td, err := TempDir(dir, "ezx-*")
+	if err != nil {
+		t.Fatalf("TempDir: %v", err)
+	}
+	if !Exists(td) {
+		t.Fatalf("temp dir %q does not exist", td)
+	}
+}

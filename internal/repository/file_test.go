@@ -64,6 +64,47 @@ func TestProvisionFile_ConditionGatesProvision(t *testing.T) {
 	}
 }
 
+func TestProvisionFile_CreateOnlySkipsExisting(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "conf")
+	write(t, target, "user=provided\n")
+
+	fp := domain.FileProvision{
+		Path:       target,
+		CreateOnly: true,
+		Operations: []domain.FileOperation{
+			{Type: domain.FileOpReplace, Value: "default-config"},
+		},
+	}
+	if err := provisionFile(fp); err != nil {
+		t.Fatalf("provisionFile: %v", err)
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != "user=provided\n" {
+		t.Fatalf("CreateOnly clobbered existing file: %q", string(got))
+	}
+}
+
+func TestProvisionFile_CreateOnlyWritesWhenMissing(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "conf")
+
+	fp := domain.FileProvision{
+		Path:       target,
+		CreateOnly: true,
+		Operations: []domain.FileOperation{
+			{Type: domain.FileOpReplace, Value: "default-config"},
+		},
+	}
+	if err := provisionFile(fp); err != nil {
+		t.Fatalf("provisionFile: %v", err)
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != "default-config" {
+		t.Fatalf("CreateOnly should write when missing, got %q", string(got))
+	}
+}
+
 func TestProvisionFile_SetPropertyIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "pgbackrest.conf")

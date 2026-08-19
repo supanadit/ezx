@@ -7,6 +7,39 @@ import (
 	"time"
 )
 
+// Symlink creates a symbolic link newpath pointing to target.
+func Symlink(target, newpath string) error {
+	return os.Symlink(target, newpath)
+}
+
+// Realpath resolves symlinks and returns the canonical absolute path.
+func Realpath(path string) (string, error) {
+	return filepath.EvalSymlinks(path)
+}
+
+// TempFile creates a new temporary file with the given pattern in dir
+// (or the system temp dir if dir is empty) and returns its path.
+func TempFile(dir, pattern string) (string, error) {
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	_ = f.Close()
+	return name, nil
+}
+
+// TempDir creates a new temporary directory with the given pattern and
+// returns its path.
+func TempDir(dir, pattern string) (string, error) {
+	return os.MkdirTemp(dir, pattern)
+}
+
+// Umask sets the process umask and returns the previous umask.
+func Umask(mask int) int {
+	return syscallUmask(mask)
+}
+
 // FSInfo describes a filesystem entry for scripts (a JS-friendly view of
 // os.FileInfo). Mode is the permission bits as an integer.
 type FSInfo struct {

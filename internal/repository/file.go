@@ -53,6 +53,13 @@ func provisionFile(fp domain.FileProvision) error {
 
 	baseTarget := expandEnvVars(fp.Path, nil)
 
+	// CreateOnly: skip if the target already exists (don't clobber user configs).
+	if fp.CreateOnly {
+		if _, err := os.Stat(baseTarget); err == nil {
+			return nil
+		}
+	}
+
 	// ProcessFunc takes full control of file processing.
 	if fp.ProcessFunc != nil {
 		editor := newFileEditor(baseTarget)

@@ -20,6 +20,7 @@ type EzxModule struct {
 	Chain   *ChainModule   `goja:"chain"`
 	FS      *FSModule      `goja:"fs"`
 	Health  *HealthModule  `goja:"health"`
+	Probe   *ProbeModule   `goja:"probe"`
 }
 
 // NewEzxModule builds the aggregate ezx module from the given dependencies.
@@ -41,5 +42,6 @@ func NewEzxModule(
 		Chain:   NewChainModule(ctx, orch),
 		FS:      NewFSModule(),
 		Health:  NewHealthModule(health),
+		Probe:   NewProbeModule(ctx),
 	}
 }
