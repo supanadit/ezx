@@ -12,6 +12,16 @@ type ProcessNode struct {
 	Files []FileProvision
 	// NeedParentReady indicates if this process requires its parent in the tree to be fully ready before starting (optional; defaults to false).
 	NeedParentReady bool
+	// Readiness is an optional readiness probe checked after Start. When
+	// NeedParentReady is true, children wait until this probe passes (or Start
+	// returns if no probe is set).
+	Readiness *Probe
+	// Restart controls whether and how this process is restarted on failure
+	// (optional; nil means never restart).
+	Restart *RestartPolicy
+	// Shutdown controls graceful shutdown of this process (optional; nil means
+	// SIGTERM, 30s timeout, force-kill enabled).
+	Shutdown *ShutdownConfig
 	// Children is a slice of dependent child processes (recursive for unlimited depth).
 	Children []ProcessNode
 }

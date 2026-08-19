@@ -35,4 +35,7 @@ type Process struct {
 	FilterEnvPattern []string
 	// WorkingDir is the optional working directory (optional; empty string means use current directory).
 	WorkingDir string
+	// Log controls how the process's stdout/stderr are routed (optional; nil means
+	// inherit the parent's stdout/stderr).
+	Log *LogConfig
 }

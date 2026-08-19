@@ -1,4 +1,4 @@
-package system
+package repository
 
 import (
 	"os"
@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/envutil"
 )
 
 func read(t *testing.T, path string) string {
@@ -435,7 +434,7 @@ func TestProcessFuncConditionalRemove(t *testing.T) {
 	fp := domain.FileProvision{
 		Path: target,
 		ProcessFunc: func(editor domain.FileEditor, environ []string) error {
-			if envutil.HasValue(environ, "REMOVE_SECRET", "true") {
+			if HasValue(environ, "REMOVE_SECRET", "true") {
 				return editor.Remove("^secret=")
 			}
 			return nil

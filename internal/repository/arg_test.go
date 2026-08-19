@@ -1,4 +1,4 @@
-package system
+package repository
 
 import (
 	"errors"
@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/envutil"
 )
 
 func TestBuildArgsInterpolationDefault(t *testing.T) {
@@ -18,9 +17,9 @@ func TestBuildArgsInterpolationDefault(t *testing.T) {
 			"--config.file=${PROMETHEUS_CONFIG_FILE:-/etc/prometheus.yml}",
 		},
 	}
-	got, err := buildArgs(p, nil)
+	got, err := BuildArgs(p, nil)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--web.listen-address=:9090", "--config.file=/etc/prometheus.yml"}
 	if !reflect.DeepEqual(got, want) {
@@ -33,9 +32,9 @@ func TestBuildArgsInterpolationFromEnv(t *testing.T) {
 	p := domain.Process{
 		Arguments: []string{"--web.listen-address=:${PROMETHEUS_PORT:-9090}"},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--web.listen-address=:12345"}
 	if !reflect.DeepEqual(got, want) {
@@ -48,9 +47,9 @@ func TestBuildArgsInterpolationEmptyVarUsesDefault(t *testing.T) {
 	p := domain.Process{
 		Arguments: []string{"--port=${PROMETHEUS_PORT:-9090}"},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--port=9090"}
 	if !reflect.DeepEqual(got, want) {
@@ -68,9 +67,9 @@ func TestBuildArgsIfSetValue(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--web.config.file=/etc/web.yml"}
 	if !reflect.DeepEqual(got, want) {
@@ -84,9 +83,9 @@ func TestBuildArgsIfSetValueUnset(t *testing.T) {
 			{Flag: "--web.config.file", FromEnv: "PROMETHEUS_WEB_CONFIG_FILE"},
 		},
 	}
-	got, err := buildArgs(p, nil)
+	got, err := BuildArgs(p, nil)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("args = %v, want none", got)
@@ -104,9 +103,9 @@ func TestBuildArgsIfTruthyFlag(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--web.enable-lifecycle"}
 	if !reflect.DeepEqual(got, want) {
@@ -124,9 +123,9 @@ func TestBuildArgsIfTruthyFlagNotSet(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, nil)
+	got, err := BuildArgs(p, nil)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("args = %v, want none", got)
@@ -145,9 +144,9 @@ func TestBuildArgsIfTruthyValue(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--client-cert-auth=true"}
 	if !reflect.DeepEqual(got, want) {
@@ -167,9 +166,9 @@ func TestBuildArgsIfTruthyFeature(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--enable-feature=native-histograms"}
 	if !reflect.DeepEqual(got, want) {
@@ -188,9 +187,9 @@ func TestBuildArgsCommaSplitList(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--endpoint=store1:10901", "--endpoint=store2:10901"}
 	if !reflect.DeepEqual(got, want) {
@@ -215,9 +214,9 @@ func TestBuildArgsPatternEnum(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{`--label=datacenter="dc1"`, `--label=tenant="acme"`}
 	if !reflect.DeepEqual(got, want) {
@@ -236,9 +235,9 @@ func TestBuildArgsWhitespaceSplitRaw(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"-log.level=debug", "-ingester.replication-factor=3"}
 	if !reflect.DeepEqual(got, want) {
@@ -257,9 +256,9 @@ func TestBuildArgsFlagSpace(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--data-dir", "/data"}
 	if !reflect.DeepEqual(got, want) {
@@ -275,16 +274,16 @@ func TestBuildArgsNumericGating(t *testing.T) {
 				Flag:    "-ingester.max-global-series-per-tenant",
 				FromEnv: "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT",
 				ConditionFunc: func(environ []string) bool {
-					v := envutil.Get(environ, "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT", "")
+					v := Get(environ, "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT", "")
 					n, err := strconv.Atoi(v)
 					return err == nil && n > 0
 				},
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"-ingester.max-global-series-per-tenant=1000"}
 	if !reflect.DeepEqual(got, want) {
@@ -300,16 +299,16 @@ func TestBuildArgsNumericGatingZeroSkips(t *testing.T) {
 				Flag:    "-ingester.max-global-series-per-tenant",
 				FromEnv: "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT",
 				ConditionFunc: func(environ []string) bool {
-					v := envutil.Get(environ, "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT", "")
+					v := Get(environ, "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT", "")
 					n, err := strconv.Atoi(v)
 					return err == nil && n > 0
 				},
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("args = %v, want none", got)
@@ -325,15 +324,15 @@ func TestBuildArgsArgsFuncOverride(t *testing.T) {
 		},
 		ArgsFunc: func(environ []string) ([]string, error) {
 			var args []string
-			if envutil.Get(environ, "THANOS_COMPONENT", "") == "sidecar" {
+			if Get(environ, "THANOS_COMPONENT", "") == "sidecar" {
 				args = append(args, "--prometheus.url=http://localhost:9090")
 			}
 			return args, nil
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"sidecar", "--prometheus.url=http://localhost:9090"}
 	if !reflect.DeepEqual(got, want) {
@@ -347,8 +346,8 @@ func TestBuildArgsArgsFuncError(t *testing.T) {
 			return nil, errors.New("boom")
 		},
 	}
-	if _, err := buildArgs(p, nil); err == nil {
-		t.Fatal("buildArgs should propagate ArgsFunc error")
+	if _, err := BuildArgs(p, nil); err == nil {
+		t.Fatal("BuildArgs should propagate ArgsFunc error")
 	}
 }
 
@@ -358,8 +357,8 @@ func TestBuildArgsInvalidPattern(t *testing.T) {
 			{Flag: "--x", FromEnvPattern: "("},
 		},
 	}
-	if _, err := buildArgs(p, nil); err == nil {
-		t.Fatal("buildArgs should error on invalid FromEnvPattern")
+	if _, err := BuildArgs(p, nil); err == nil {
+		t.Fatal("BuildArgs should error on invalid FromEnvPattern")
 	}
 }
 
@@ -377,9 +376,9 @@ func TestBuildArgsNameTransformFunc(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--label=datacenter=dc1"}
 	if !reflect.DeepEqual(got, want) {
@@ -400,9 +399,9 @@ func TestBuildArgsValueTransformFunc(t *testing.T) {
 			},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"--web.external-url=HTTP://PROM.LOCAL"}
 	if !reflect.DeepEqual(got, want) {
@@ -418,9 +417,9 @@ func TestBuildArgsConcatOrder(t *testing.T) {
 			{Flag: "--foo", FromEnv: "FOO"},
 		},
 	}
-	got, err := buildArgs(p, env)
+	got, err := BuildArgs(p, env)
 	if err != nil {
-		t.Fatalf("buildArgs: %v", err)
+		t.Fatalf("BuildArgs: %v", err)
 	}
 	want := []string{"static-arg", "--foo=1"}
 	if !reflect.DeepEqual(got, want) {

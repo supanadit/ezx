@@ -1,4 +1,4 @@
-package system
+package repository
 
 import (
 	"bytes"
@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/envutil"
 )
 
 // envSource represents a resolved value source for an operation execution.
@@ -32,8 +31,9 @@ var (
 	interpolationPattern = regexp.MustCompile(`\$\{(value|name|[0-9]+)\}`)
 )
 
-// provisionFiles applies each FileProvision to its target file.
-func provisionFiles(files []domain.FileProvision) error {
+// ProvisionFiles applies each FileProvision rule to its target file on the
+// local filesystem.
+func ProvisionFiles(files []domain.FileProvision) error {
 	for _, fp := range files {
 		if err := provisionFile(fp); err != nil {
 			return fmt.Errorf("provision file %q: %w", fp.Path, err)
@@ -157,7 +157,7 @@ func applyOperation(op domain.FileOperation, target string, permission os.FileMo
 func resolveSources(op domain.FileOperation) ([]envSource, error) {
 	switch {
 	case op.FromEnvPattern != "":
-		matches, err := envutil.Enumerate(os.Environ(), op.FromEnvPattern)
+		matches, err := Enumerate(os.Environ(), op.FromEnvPattern)
 		if err != nil {
 			return nil, fmt.Errorf("invalid FromEnvPattern %q: %w", op.FromEnvPattern, err)
 		}
@@ -366,9 +366,9 @@ func envConditionMet(c domain.EnvCondition, environ []string) bool {
 		return true
 	}
 	if c.Value == "" {
-		return envutil.IsSet(environ, c.Name)
+		return IsSet(environ, c.Name)
 	}
-	return envutil.HasValue(environ, c.Name, c.Value)
+	return HasValue(environ, c.Name, c.Value)
 }
 
 // ensureParentDir creates the parent directory of path if it does not exist.
@@ -779,4 +779,70 @@ func lookupIDFromFile(path, name string, nameField, idField int) (int, error) {
 		return id, nil
 	}
 	return -1, os.ErrNotExist
+}
+
+// fileEditor implements domain.FileEditor by delegating to the same operations
+// used by the declarative Operations path. It wraps a target file path.
+type fileEditor struct {
+	target string
+}
+
+// newFileEditor returns a FileEditor bound to the given target path.
+func newFileEditor(target string) domain.FileEditor {
+	return &fileEditor{target: target}
+}
+
+func (e *fileEditor) Path() string {
+	return e.target
+}
+
+func (e *fileEditor) Read() (string, error) {
+	return readContent(e.target)
+}
+
+func (e *fileEditor) ReadLines() ([]string, error) {
+	return readLines(e.target)
+}
+
+func (e *fileEditor) WriteLines(lines []string) error {
+	return writeLines(e.target, lines)
+}
+
+func (e *fileEditor) Replace(content string) error {
+	if err := ensureParentDir(e.target); err != nil {
+		return err
+	}
+	return os.WriteFile(e.target, []byte(content), 0o644)
+}
+
+func (e *fileEditor) Append(content string) error {
+	return appendContent(e.target, content)
+}
+
+func (e *fileEditor) Remove(pattern string) error {
+	return opRemove(e.target, domain.FileOperation{Pattern: pattern}, envSource{})
+}
+
+func (e *fileEditor) Ensure(line string) error {
+	return opEnsure(e.target, domain.FileOperation{Value: line}, envSource{})
+}
+
+func (e *fileEditor) Upsert(pattern, value string) error {
+	return opSetProperty(e.target, domain.FileOperation{Pattern: pattern, Value: value}, envSource{})
+}
+
+func (e *fileEditor) InsertBefore(pattern, content string) error {
+	return opInsert(e.target, domain.FileOperation{Pattern: pattern, Value: content}, envSource{}, false)
+}
+
+func (e *fileEditor) InsertAfter(pattern, content string) error {
+	return opInsert(e.target, domain.FileOperation{Pattern: pattern, Value: content}, envSource{}, true)
+}
+
+func (e *fileEditor) ReplaceBlock(startPattern, endPattern, value string) error {
+	return opReplaceBlock(e.target, domain.FileOperation{Pattern: startPattern, BlockEnd: endPattern, Value: value}, envSource{})
+}
+
+func (e *fileEditor) SetBlock(startPattern, endPattern, marker, value string) error {
+	return opSetBlock(e.target, domain.FileOperation{Pattern: startPattern, BlockEnd: endPattern, Marker: marker, Value: value}, envSource{})
 }

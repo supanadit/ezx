@@ -1,4 +1,4 @@
-package system
+package repository
 
 import (
 	"fmt"
@@ -6,15 +6,14 @@ import (
 	"strings"
 
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/envutil"
 )
 
-// buildArgs assembles the CLI arguments for a spawned process from the environment:
+// BuildArgs assembles the CLI arguments for a spawned process from the environment:
 // the static Arguments (with ${VAR} and ${VAR:-default} interpolation), then the
 // declarative ArgOperations. If ArgsFunc is set it overrides ArgOperations and its
 // result is appended after Arguments. Runs after file provisioning so arg-building
 // callbacks see the full environment.
-func buildArgs(p domain.Process, environ []string) ([]string, error) {
+func BuildArgs(p domain.Process, environ []string) ([]string, error) {
 	var args []string
 	lookup := lookupFrom(environ)
 	for _, a := range p.Arguments {
@@ -41,7 +40,7 @@ func buildArgs(p domain.Process, environ []string) ([]string, error) {
 // interpolation.
 func lookupFrom(environ []string) func(string) (string, bool) {
 	return func(name string) (string, bool) {
-		return envutil.Lookup(environ, name)
+		return Lookup(environ, name)
 	}
 }
 
@@ -62,7 +61,7 @@ func executeArgOperation(op domain.ArgOperation, environ []string) ([]string, er
 
 	// Pattern-enum: repeat once per env var match, transforming the captured name.
 	if op.FromEnvPattern != "" {
-		matches, err := envutil.Enumerate(environ, op.FromEnvPattern)
+		matches, err := Enumerate(environ, op.FromEnvPattern)
 		if err != nil {
 			return nil, fmt.Errorf("invalid FromEnvPattern %q: %w", op.FromEnvPattern, err)
 		}
@@ -83,9 +82,9 @@ func executeArgOperation(op domain.ArgOperation, environ []string) ([]string, er
 
 	// FromEnv: a single env var drives the value (and may gate a bare-flag toggle).
 	if op.FromEnv != "" {
-		value, ok := envutil.Lookup(environ, op.FromEnv)
+		value, ok := Lookup(environ, op.FromEnv)
 		if op.Format == domain.ArgFormatBareFlag {
-			if ok && envutil.IsTruthyValue(value) {
+			if ok && IsTruthyValue(value) {
 				return []string{op.Flag}, nil
 			}
 			return nil, nil

@@ -8,8 +8,10 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/envutil"
+	"github.com/supanadit/ezx/internal/repository"
 	"github.com/supanadit/ezx/internal/repository/system"
+	"github.com/supanadit/ezx/orchestrator"
+	"github.com/supanadit/ezx/process"
 )
 
 func main() {
@@ -127,7 +129,7 @@ func main() {
 					{
 						Path: "/tmp/ezx-php.ini",
 						ProcessFunc: func(editor domain.FileEditor, environ []string) error {
-							limit := envutil.Get(environ, "PHP_MEMORY_LIMIT", "")
+							limit := repository.Get(environ, "PHP_MEMORY_LIMIT", "")
 							if limit == "" {
 								return nil
 							}
@@ -183,8 +185,22 @@ func main() {
 			},
 		},
 	}
-	pn1 := system.NewProcessNodeRepository(chainSample.Roots[0])
-	if _, err := pn1.Execute(context.Background()); err != nil {
+	// Compose the supervisor: wire the process adapter and logger into the
+	// orchestrator. File/arg provisioning and probes are handled by the
+	// internal/repository helpers.
+	log := system.NewLogger()
+	svc := orchestrator.NewService(
+		func(node domain.ProcessNode) process.ProcessRepository {
+			return system.NewProcessRepository(node)
+		},
+		log,
+	)
+
+	// Run the chainSample under the supervisor. The roots run in a goroutine so
+	// a context cancel (e.g. SIGTERM/SIGINT) triggers graceful drain.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := svc.Run(ctx, chainSample); err != nil {
 		fmt.Println("❌ EZX failed:", err)
 	}
 	fmt.Println("✅ EZX started successfully!")

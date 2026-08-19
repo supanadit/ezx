@@ -1,8 +1,8 @@
-// Package envutil provides common environment variable lookup, boolean, and
-// enumeration helpers for callback developers. It is the Go counterpart of the
-// shared helpers.sh functions (is_truthy, normalize_bool) used across container
-// entrypoint scripts, so porting shell logic to EZX callbacks stays familiar.
-package envutil
+// Package repository provides driver-agnostic shared helpers for the swappable
+// repository drivers. It mirrors the helper placement in go-clean-arch
+// (internal/repository/helper.go): helpers that are common to all drivers live
+// here, not under a specific <driver>/ directory.
+package repository
 
 import (
 	"fmt"
