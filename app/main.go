@@ -4,11 +4,16 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
+	"os/signal"
+	"syscall"
 
-	"github.com/spf13/viper"
+	"github.com/spf13/cobra"
+	"go.uber.org/fx"
+
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/internal/repository/system"
+	"github.com/supanadit/ezx/internal/terminal"
+	"github.com/supanadit/ezx/logger"
 	"github.com/supanadit/ezx/orchestrator"
 	"github.com/supanadit/ezx/process"
 	"github.com/supanadit/ezx/script"
@@ -16,67 +21,61 @@ import (
 )
 
 func main() {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		panic("You must have a home directory set for ezx to work")
-	}
+	// Derive a context cancelled by SIGINT/SIGTERM. It is attached to the root
+	// cobra command; cancelling it interrupts a running bootstrap script.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	ezxHomeDir := filepath.Join(home, ".ezx")
-	viper.Set("EZX_DIR_HOME", ezxHomeDir)
-	viper.SetDefault("EZX_DIR_TOOLS", filepath.Join(ezxHomeDir, "tools"))
-	viper.SetDefault("EZX_DIR_SANDBOX", filepath.Join(ezxHomeDir, "sandbox"))
+	rootCmd := terminal.NewRootCmd()
+	rootCmd.SetContext(ctx)
 
-	if len(os.Args) < 2 {
-		fmt.Println("usage: ezx bootstrap <script.js>")
+	app := fx.New(
+		fx.NopLogger,
+		fx.Supply(rootCmd),
+		fx.Provide(
+			fx.Annotate(system.NewLogger, fx.As(new(logger.Logger))),
+			provideProcessFactory,
+			provideScriptFactory,
+			orchestrator.NewService,
+			script.NewRegistry,
+			fx.Annotate(system.NewScriptEngine, fx.As(new(script.ScriptEngine))),
+			scriptmodules.NewEzxModule,
+		),
+		fx.Invoke(terminal.NewBootstrapHandler, registerRootCmd),
+	)
+
+	if err := app.Start(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	cmd := os.Args[1]
-	switch cmd {
-	case "bootstrap":
-		if len(os.Args) < 3 {
-			fmt.Println("usage: ezx bootstrap <script.js>")
-			os.Exit(1)
-		}
-		bootstrap(os.Args[2])
-	default:
-		fmt.Printf("unknown command %q\n", cmd)
-		fmt.Println("usage: ezx bootstrap <script.js>")
+
+	if err := app.Stop(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-// bootstrap runs a user-supplied JavaScript entrypoint script against the ezx
-// host API (require("ezx")). It composes the process adapter, orchestrator,
-// logger, and registers the host modules.
-func bootstrap(path string) {
-	log := system.NewLogger()
-
-	// Compose the supervisor used by the optional ezx.chain helper.
-	orch := orchestrator.NewService(
-		func(node domain.ProcessNode) process.ProcessRepository {
-			return system.NewProcessRepository(node)
+// registerRootCmd runs the root command once the fx app starts.
+func registerRootCmd(rootCmd *cobra.Command, lc fx.Lifecycle) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			return rootCmd.Execute()
 		},
-		log,
-	)
-	procFactory := func(node domain.ProcessNode) process.ProcessRepository {
+	})
+}
+
+// provideProcessFactory provides the per-node process factory used by the
+// orchestrator.
+func provideProcessFactory() orchestrator.ProcessFactory {
+	return func(node domain.ProcessNode) process.ProcessRepository {
 		return system.NewProcessRepository(node)
 	}
+}
 
-	// Register the aggregate host module exposed to scripts via require("ezx").
-	registry := script.NewRegistry()
-	registry.Register("ezx", func() any {
-		return scriptmodules.NewEzxModule(log, procFactory, orch)
-	})
-
-	engine := system.NewScriptEngine(registry)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	fmt.Printf("🚀 EZX bootstrapping %s\n", path)
-	if err := engine.RunFile(ctx, path); err != nil {
-		fmt.Println("❌ EZX failed:", err)
-		os.Exit(1)
+// provideScriptFactory provides the same per-node process factory typed for the
+// script host module, whose ProcessFactory is a distinct named type.
+func provideScriptFactory() scriptmodules.ProcessFactory {
+	return func(node domain.ProcessNode) process.ProcessRepository {
+		return system.NewProcessRepository(node)
 	}
-	fmt.Println("✅ EZX bootstrap complete")
 }
