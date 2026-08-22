@@ -1,0 +1,107 @@
+name: Release
+
+# Triggered automatically whenever a semantic-version tag is pushed
+# (e.g. `0.0.1`, `v0.0.1`). Builds release binaries + checksums + shell
+# completions for every OS/arch and uploads them to a GitHub Release for the
+# tag. Modeled on the phpv release pipeline.
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            artifact_name: ezx-${{ github.ref_name }}-linux-amd64
+          - os: linux
+            arch: arm64
+            artifact_name: ezx-${{ github.ref_name }}-linux-arm64
+          - os: darwin
+            arch: amd64
+            artifact_name: ezx-${{ github.ref_name }}-darwin-amd64
+          - os: darwin
+            arch: arm64
+            artifact_name: ezx-${{ github.ref_name }}-darwin-arm64
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          echo "Building for ${{ matrix.os }}/${{ matrix.arch }}"
+          go build -trimpath -o ${{ matrix.artifact_name }} ./app
+          chmod +x ${{ matrix.artifact_name }}
+
+      - name: Generate checksum
+        run: |
+          sha256sum ${{ matrix.artifact_name }} > ${{ matrix.artifact_name }}.sha256
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  generate-completions:
+    name: Generate Shell Completions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Build binary
+        run: |
+          go build -trimpath -o ezx ./app
+
+      - name: Generate completions
+        run: |
+          mkdir -p completions
+          ./ezx completion bash > completions/ezx.bash
+          ./ezx completion zsh > completions/_ezx
+          ./ezx completion fish > completions/ezx.fish
+          ./ezx completion powershell > completions/ezx.ps1
+
+      - name: Upload completions
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            completions/ezx.bash
+            completions/_ezx
+            completions/ezx.fish
+            completions/ezx.ps1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
