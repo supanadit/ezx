@@ -49,7 +49,16 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	}
 
 	cmd := exec.CommandContext(ctx, s.node.Process.BinaryPath, s.node.Process.Arguments...)
-	cmd.Env = procEnv
+	// An empty (or nil) process environment means "inherit the parent's
+	// environment" — matching Go's exec.Cmd semantics (cmd.Env == nil inherits).
+	// Without this, script calls like process.spawn(...).start([]) would spawn a
+	// child with no PATH, so shell commands (initdb, pg_ctl, psql) fail with
+	// "command not found".
+	if len(procEnv) == 0 {
+		cmd.Env = nil
+	} else {
+		cmd.Env = procEnv
+	}
 	cmd.Dir = s.node.Process.WorkingDir
 	if err := repository.ApplyCredential(cmd, s.node.Process); err != nil {
 		return err
@@ -101,11 +110,15 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 // Wait blocks until the process exits and returns its exit code.
 func (s *ProcessRepository) Wait() (int, error) {
 	<-s.done
+	if s.reaper != nil {
+		// The reaper recorded the authoritative exit code (it reaps via
+		// wait4). ProcessState is unpopulated because cmd.Wait was never
+		// called, so fall back to s.code rather than ExitCode() which would
+		// return -1 even for a clean exit-0 process.
+		return s.code, nil
+	}
 	if s.cmd == nil {
 		return -1, nil
-	}
-	if s.code != 0 {
-		return s.code, nil
 	}
 	return s.cmd.ProcessState.ExitCode(), nil
 }
