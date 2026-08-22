@@ -1,9 +1,8 @@
 name: Release
 
 # Triggered automatically whenever a semantic-version tag is pushed
-# (e.g. `0.0.1`, `v0.0.1`). Builds release binaries + checksums + shell
-# completions for every OS/arch and uploads them to a GitHub Release for the
-# tag. Modeled on the phpv release pipeline.
+# (e.g. `0.0.1`, `v0.0.1`). Builds release binaries + checksums for every
+# OS/arch and uploads them to a GitHub Release for the tag.
 on:
   push:
     tags:
@@ -65,43 +64,5 @@ jobs:
           files: |
             ${{ matrix.artifact_name }}
             ${{ matrix.artifact_name }}.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  generate-completions:
-    name: Generate Shell Completions
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-          cache: true
-
-      - name: Build binary
-        run: |
-          go build -trimpath -o ezx ./app
-
-      - name: Generate completions
-        run: |
-          mkdir -p completions
-          ./ezx completion bash > completions/ezx.bash
-          ./ezx completion zsh > completions/_ezx
-          ./ezx completion fish > completions/ezx.fish
-          ./ezx completion powershell > completions/ezx.ps1
-
-      - name: Upload completions
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            completions/ezx.bash
-            completions/_ezx
-            completions/ezx.fish
-            completions/ezx.ps1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
