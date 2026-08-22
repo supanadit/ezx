@@ -27,6 +27,7 @@ type EzxModule struct {
 	Scheduler *SchedulerModule `goja:"scheduler"`
 	API       *ApiModule       `goja:"api"`
 	YAML      *YamlModule      `goja:"yaml"`
+	Config    *ConfigModule    `goja:"config"`
 }
 
 // NewEzxModule builds the aggregate ezx module from the given dependencies.
@@ -54,6 +55,7 @@ func NewEzxModule(
 		Scheduler: NewSchedulerModule(orch),
 		API:       NewApiModule(e, rt),
 		YAML:      NewYamlModule(),
+		Config:    NewConfigModule(),
 	}
 }
 
