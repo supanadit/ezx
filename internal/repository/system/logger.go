@@ -35,7 +35,15 @@ func (l *Logger) logf(level logger.Level, format string, args ...any) {
 	if !l.Enabled(level) {
 		return
 	}
-	line := fmt.Sprintf(format, args...)
+	// When no args are supplied, treat the message as a literal string rather
+	// than a Sprintf format — otherwise configs containing "%" (e.g. a postgres
+	// archive_command with "%p") render as "%!p(MISSING)" in logs.
+	var line string
+	if len(args) == 0 {
+		line = format
+	} else {
+		line = fmt.Sprintf(format, args...)
+	}
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
 	}

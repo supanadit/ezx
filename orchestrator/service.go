@@ -94,13 +94,15 @@ func (s *Service) hasActiveSiblings() bool {
 
 // runNode drives a single ProcessNode through its lifecycle. execDefault is
 // true when this node is a lone leaf root that should exec by default.
+//
+// Children (both needParentReady and not) are supervised concurrently with the
+// parent in goroutines. needParentReady children wait for the parent's
+// readiness probe before starting. When the parent's supervision ends (process
+// exit without restart, or context cancellation), the node's context is
+// cancelled so all children drain. The first error from any goroutine cancels
+// the node and fails fast (init-style children like stanza-create must not
+// silently fail while sidecars keep running).
 func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefault bool) error {
-	// Start children that do NOT require parent readiness first (parallel with
-	// the parent), mirroring the original Execute ordering.
-	if err := s.runChildren(ctx, node, false); err != nil {
-		return err
-	}
-
 	// Provision files before starting the process.
 	if err := repository.ProvisionFiles(node.Files); err != nil {
 		s.log.Error("[%s] file provisioning failed: %v", node.Name, err)
@@ -205,24 +207,61 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 		}
 	}
 
-	// Start children that require parent readiness now that the parent is up.
-	if err := s.runChildren(ctx, node, true); err != nil {
-		return err
-	}
+	// Supervise the parent and every child concurrently. Cancelling nodeCtx
+	// (parent supervision ended, or a child failed) drains the whole subtree.
+	nodeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	return s.supervise(ctx, node, proc)
-}
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(node.Children)+1)
 
-// runChildren starts either the need-parent-ready or the no-wait children.
-func (s *Service) runChildren(ctx context.Context, node domain.ProcessNode, needReady bool) error {
-	for _, child := range node.Children {
-		if child.NeedParentReady == needReady {
-			if err := s.runNode(ctx, child, false); err != nil {
-				return err
+	// Children not requiring parent readiness run concurrently with the parent.
+	s.spawnChildren(nodeCtx, node, false, &wg, errCh, cancel)
+	// Children requiring parent readiness run concurrently once the parent is up.
+	s.spawnChildren(nodeCtx, node, true, &wg, errCh, cancel)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := s.supervise(nodeCtx, node, proc); err != nil {
+			select {
+			case errCh <- err:
+			default:
 			}
 		}
+		// Parent supervision ended: drain the children.
+		cancel()
+	}()
+
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
 	}
-	return nil
+}
+
+// spawnChildren launches each matching child (by needParentReady) in its own
+// goroutine, supervised concurrently with the parent. The first child error is
+// reported on errCh and cancels the node so siblings and the parent drain.
+func (s *Service) spawnChildren(ctx context.Context, node domain.ProcessNode, needReady bool, wg *sync.WaitGroup, errCh chan error, cancel context.CancelFunc) {
+	for _, child := range node.Children {
+		if child.NeedParentReady != needReady {
+			continue
+		}
+		wg.Add(1)
+		go func(c domain.ProcessNode) {
+			defer wg.Done()
+			if err := s.runNode(ctx, c, false); err != nil {
+				select {
+				case errCh <- err:
+					cancel()
+				default:
+				}
+			}
+		}(child)
+	}
 }
 
 // pollReadiness polls the probe and reports readiness on the health service
@@ -562,7 +601,10 @@ func (s *Service) triggerFor(name string) *domain.Trigger {
 }
 
 // drain gracefully stops the process: sends the shutdown signal, waits for the
-// timeout, then force-kills if enabled.
+// timeout, then force-kills if enabled. It always waits for the process after
+// signaling — even when ctx is already cancelled (e.g. a parent process exited
+// and cancelled the node context, so its supervised children must still drain
+// cleanly) — rather than returning ctx.Err() immediately.
 func (s *Service) drain(ctx context.Context, proc process.ProcessRepository, cfg domain.ShutdownConfig) error {
 	if err := proc.Signal(cfg.Signal); err != nil {
 		s.log.Warn("signal failed: %v", err)
@@ -578,7 +620,5 @@ func (s *Service) drain(ctx context.Context, proc process.ProcessRepository, cfg
 			return proc.Kill()
 		}
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 }

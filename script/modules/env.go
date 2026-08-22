@@ -28,9 +28,18 @@ func (m *EnvModule) Has(name string) bool {
 	return repository.IsSet(os.Environ(), name)
 }
 
-// IsTruthy reports whether an environment variable is truthy.
-func (m *EnvModule) IsTruthy(name string) bool {
-	return repository.IsTruthy(os.Environ(), name)
+// IsTruthy reports whether an environment variable is truthy. When the
+// variable is unset or empty and a default is provided, the default determines
+// the result — the shell default-true pattern (e.g. PGBACKREST_VERIFY default
+// true). Without a default, unset/empty is falsy.
+func (m *EnvModule) IsTruthy(name string, def ...string) bool {
+	if v, ok := repository.Lookup(os.Environ(), name); ok && v != "" {
+		return repository.IsTruthyValue(v)
+	}
+	if len(def) > 0 {
+		return repository.IsTruthyValue(def[0])
+	}
+	return false
 }
 
 // NormalizeBool normalizes a raw value to "true", "false", or "".

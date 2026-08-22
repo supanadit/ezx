@@ -76,3 +76,19 @@ func TestYamlBuildEmptyValue(t *testing.T) {
 		t.Errorf("empty string should be quoted\n---\n%s", out)
 	}
 }
+
+// TestYamlBuildPercent verifies literal "%" in scalar values (e.g. a postgres
+// archive_command with "%p") round-trips intact — the mangling seen in logs is
+// a logger Sprintf artifact, not a yaml-build issue.
+func TestYamlBuildPercent(t *testing.T) {
+	m := NewYamlModule()
+	out, err := m.Build(map[string]any{
+		"archive_command": "env -u PGBACKREST_ENABLE pgbackrest archive-push %p",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(out, "archive_command: env -u PGBACKREST_ENABLE pgbackrest archive-push %p") {
+		t.Errorf("percent mangled\n---\n%s", out)
+	}
+}

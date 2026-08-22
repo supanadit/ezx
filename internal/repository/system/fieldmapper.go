@@ -2,6 +2,7 @@ package system
 
 import (
 	"reflect"
+	"strings"
 	"unicode"
 
 	"github.com/dop251/goja"
@@ -32,6 +33,10 @@ func lowerName(s string) string {
 	i := 0
 	for i < len(s) && s[i] >= 'A' && s[i] <= 'Z' {
 		i++
+	}
+	if i == len(s) {
+		// All-caps name (TCP, HTTP, PID, FS): lowercase it entirely.
+		return strings.ToLower(s)
 	}
 	if i > 1 && i < len(s) && s[i] >= 'a' && s[i] <= 'z' {
 		// All-caps run followed by a lowercase letter: keep the last upper as

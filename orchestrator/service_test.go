@@ -85,6 +85,10 @@ func TestRunStartsNeedReadyChildAfterParent(t *testing.T) {
 	startC := make(chan string, 10)
 	parent := newFakeProc("parent", 0, startC)
 	child := newFakeProc("child", 0, startC)
+	// The parent must stay "running" (not exit immediately) so the supervised
+	// child can start before the parent's supervision ends and drains it.
+	parent.delay = 500 * time.Millisecond
+	child.delay = 500 * time.Millisecond
 	procs := map[string]*fakeProc{"parent": parent, "child": child}
 	svc := newTestService(procs)
 
@@ -111,6 +115,56 @@ func TestRunStartsNeedReadyChildAfterParent(t *testing.T) {
 	}
 	if len(order) != 2 || order[0] != "parent" || order[1] != "child" {
 		t.Fatalf("start order = %v, want [parent child]", order)
+	}
+}
+
+// TestRunNeedReadyChildrenConcurrent verifies that multiple needParentReady
+// children supervise concurrently with each other and with the parent — the
+// single-chain sidecar topology (postgres + pgbouncer + sshd + backups).
+func TestRunNeedReadyChildrenConcurrent(t *testing.T) {
+	startC := make(chan string, 10)
+	parent := newFakeProc("parent", 0, startC)
+	a := newFakeProc("sidecar-a", 0, startC)
+	b := newFakeProc("sidecar-b", 0, startC)
+	parent.delay = 400 * time.Millisecond
+	a.delay = 400 * time.Millisecond
+	b.delay = 400 * time.Millisecond
+	procs := map[string]*fakeProc{"parent": parent, "sidecar-a": a, "sidecar-b": b}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "parent",
+				Children: []domain.ProcessNode{
+					{Name: "sidecar-a", NeedParentReady: true},
+					{Name: "sidecar-b", NeedParentReady: true},
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// All three must have started before the parent supervision ends.
+	// Sequential children would only start one long-running child.
+	got := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		select {
+		case n := <-startC:
+			got[n] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for starts, got %v", got)
+		}
+	}
+	for _, n := range []string{"parent", "sidecar-a", "sidecar-b"} {
+		if !got[n] {
+			t.Errorf("process %q never started", n)
+		}
 	}
 }
 

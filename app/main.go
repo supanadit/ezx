@@ -60,9 +60,13 @@ func main() {
 		),
 		fx.Invoke(
 			terminal.NewBootstrapHandler,
-			registerRootCmd,
 			rest.NewHealthHandler,
+			// Start the health server BEFORE running the root command: the
+			// bootstrap script blocks in chain.run, so a later OnStart would
+			// never fire and the api routes (backup triggers, sync-reload,
+			// role-change poller) would never be served.
 			startHealthServer,
+			registerRootCmd,
 		),
 	)
 
