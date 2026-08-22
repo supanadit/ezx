@@ -6,11 +6,15 @@ package script
 import (
 	"context"
 	"sync"
+
+	"github.com/dop251/goja"
 )
 
 // ModuleLoader builds a host module value (a Go struct whose exported methods
-// become the script-visible API) for a script runtime.
-type ModuleLoader func() any
+// become the script-visible API) for a script runtime. The runtime is passed
+// so modules that need to call back into JS (e.g. ezx.api route handlers) can
+// retain it.
+type ModuleLoader func(rt *goja.Runtime) any
 
 // Registry holds the host modules available to scripts. It is populated by
 // package init() calls, mirroring k6's module registry.

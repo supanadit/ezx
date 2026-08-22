@@ -3,6 +3,8 @@ package terminal
 import (
 	"fmt"
 
+	"github.com/dop251/goja"
+	"github.com/labstack/echo/v4"
 	"github.com/spf13/cobra"
 
 	"github.com/supanadit/ezx/domain"
@@ -23,6 +25,7 @@ type BootstrapHandler struct {
 	engine   script.ScriptEngine
 	log      logger.Logger
 	health   domain.HealthService
+	router   *echo.Echo
 }
 
 // NewBootstrapHandler constructs the handler, registers the bootstrap
@@ -35,6 +38,7 @@ func NewBootstrapHandler(
 	engine script.ScriptEngine,
 	log logger.Logger,
 	health domain.HealthService,
+	router *echo.Echo,
 ) {
 	h := &BootstrapHandler{
 		proc:     proc,
@@ -43,6 +47,7 @@ func NewBootstrapHandler(
 		engine:   engine,
 		log:      log,
 		health:   health,
+		router:   router,
 	}
 	rootCmd.AddCommand(h.bootstrapCmd())
 }
@@ -66,8 +71,8 @@ spawn processes, and drive the orchestrator.`,
 func (h *BootstrapHandler) run(cmd *cobra.Command, args []string) error {
 	path := args[0]
 
-	h.registry.Register("ezx", func() any {
-		return scriptmodules.NewEzxModule(cmd.Context(), h.log, h.proc, h.orch, h.health)
+	h.registry.Register("ezx", func(rt *goja.Runtime) any {
+		return scriptmodules.NewEzxModule(cmd.Context(), h.log, h.proc, h.orch, h.health, h.router, rt)
 	})
 
 	fmt.Printf("🚀 EZX bootstrapping %s\n", path)

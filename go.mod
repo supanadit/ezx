@@ -5,6 +5,7 @@ go 1.25.3
 require (
 	github.com/dop251/goja v0.0.0-20260806115107-493f22071ef6
 	github.com/dop251/goja_nodejs v0.0.0-20260212111938-1f56ff5bcf14
+	github.com/goccy/go-yaml v1.19.2
 	github.com/labstack/echo/v4 v4.15.4
 	github.com/spf13/cobra v1.10.2
 	go.uber.org/fx v1.24.0

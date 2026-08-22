@@ -221,3 +221,116 @@ func TestLoneLeafRootDefaultsToExecSupervisesOnHealth(t *testing.T) {
 		t.Fatalf("health lone leaf started %d times, want >=1 (supervised, not exec'd)", started)
 	}
 }
+
+// waitScheduled polls until the named scheduled node's trigger is registered.
+func waitScheduled(t *testing.T, svc *Service, name string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if svc.Scheduled(name) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("scheduled node %q never registered", name)
+}
+
+func TestScheduledNodeManualTriggerFiresTick(t *testing.T) {
+	startC := make(chan string, 10)
+	procs := map[string]*fakeProc{"job": newFakeProc("job", 0, startC)}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "job",
+				Process: domain.Process{
+					BinaryPath: "/bin/true",
+				},
+				Scheduler: &domain.SchedulerConfig{
+					// A yearly cron that never naturally matches during the test.
+					Schedule:    domain.CronSchedule{Expression: "0 0 1 1 *"},
+					MinInterval: time.Nanosecond,
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- svc.Run(ctx, chain) }()
+
+	waitScheduled(t, svc, "job")
+
+	if !svc.Trigger("job") {
+		t.Fatal("Trigger(job) returned false, want true (registered and idle)")
+	}
+
+	select {
+	case n := <-startC:
+		if n != "job" {
+			t.Fatalf("started %q, want %q", n, "job")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for manual-trigger tick to start")
+	}
+
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestScheduledNodeUnknownTriggerAndGateSkip(t *testing.T) {
+	startC := make(chan string, 10)
+	procs := map[string]*fakeProc{"job": newFakeProc("job", 0, startC)}
+	svc := newTestService(procs)
+
+	if svc.Trigger("missing") {
+		t.Fatal("Trigger(missing) returned true, want false")
+	}
+	if svc.Scheduled("missing") {
+		t.Fatal("Scheduled(missing) returned true, want false")
+	}
+
+	// A gate that always fails must skip every tick.
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "job",
+				Process: domain.Process{
+					BinaryPath: "/bin/true",
+				},
+				Scheduler: &domain.SchedulerConfig{
+					Schedule:    domain.CronSchedule{Expression: "0 0 1 1 *"},
+					MinInterval: time.Nanosecond,
+					Gate: &domain.Probe{
+						Type: domain.ProbeTypeExec,
+						Exec: []string{"/bin/false"},
+					},
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- svc.Run(ctx, chain) }()
+	waitScheduled(t, svc, "job")
+
+	svc.Trigger("job")
+	time.Sleep(50 * time.Millisecond) // give the gate a chance to reject
+	select {
+	case n := <-startC:
+		t.Fatalf("gate should have skipped tick, but %q started", n)
+	default:
+	}
+
+	cancel()
+	<-runDone
+}

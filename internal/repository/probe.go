@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/supanadit/ezx/domain"
@@ -64,10 +65,30 @@ func checkExec(ctx context.Context, probe domain.Probe) (bool, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, probe.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, probe.Exec[0], probe.Exec[1:]...)
+	// When ExecExpect is set, capture stdout so the probe can gate on the
+	// command's output in addition to its exit code.
+	if probe.ExecExpect != "" {
+		out, err := cmd.Output()
+		if err != nil {
+			return false, err
+		}
+		return matchExecExpect(string(out), probe), nil
+	}
 	if err := cmd.Run(); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// matchExecExpect decides whether a command's stdout satisfies the probe's
+// ExecExpect: either contains (default) or equals (ExecExpectExact) after
+// trimming whitespace.
+func matchExecExpect(out string, probe domain.Probe) bool {
+	got := strings.TrimSpace(out)
+	if probe.ExecExpectExact {
+		return got == probe.ExecExpect
+	}
+	return strings.Contains(got, probe.ExecExpect)
 }
 
 func checkTCP(ctx context.Context, probe domain.Probe) (bool, error) {

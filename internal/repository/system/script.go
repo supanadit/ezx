@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/require"
@@ -22,18 +23,33 @@ func NewScriptEngine(registry *script.Registry) *ScriptEngine {
 	return &ScriptEngine{registry: registry}
 }
 
-// RunFile loads and executes the JavaScript file at path.
+// RunFile loads and executes the JavaScript file at path. The file is
+// compiled with its absolute path as the program name so relative
+// require("./x.js") calls from the entry script resolve against its directory
+// (goja_nodejs/require requires the initial script name to be absolute).
 func (s *ScriptEngine) RunFile(ctx context.Context, path string) error {
 	src, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read script %q: %w", path, err)
 	}
-	return s.RunString(ctx, string(src))
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	return s.runSource(ctx, abs, string(src))
 }
 
 // RunString loads and executes JavaScript source from a string. Imports of
-// registered host modules resolve via the goja_nodejs require registry.
+// registered host modules resolve via the goja_nodejs require registry. The
+// source name is empty, so relative require() from a RunString entry resolves
+// against the current directory; use RunFile for multi-file scripts.
 func (s *ScriptEngine) RunString(ctx context.Context, source string) error {
+	return s.runSource(ctx, "", source)
+}
+
+// runSource executes the given source on a fresh goja runtime with the given
+// program name, registering the host modules and wiring context cancellation.
+func (s *ScriptEngine) runSource(ctx context.Context, name, source string) error {
 	vm := goja.New()
 	vm.SetFieldNameMapper(newFieldNameMapper())
 
@@ -45,7 +61,7 @@ func (s *ScriptEngine) RunString(ctx context.Context, source string) error {
 		n := name
 		l := loader
 		registry.RegisterNativeModule(n, func(rt *goja.Runtime, mod *goja.Object) {
-			mod.Set("exports", l())
+			mod.Set("exports", l(rt))
 		})
 	}
 
@@ -61,7 +77,11 @@ func (s *ScriptEngine) RunString(ctx context.Context, source string) error {
 	}()
 	defer close(done)
 
-	if _, err := vm.RunString(source); err != nil {
+	prg, err := goja.Compile(name, source, false)
+	if err != nil {
+		return fmt.Errorf("compile script: %w", err)
+	}
+	if _, err := vm.RunProgram(prg); err != nil {
 		return fmt.Errorf("run script: %w", err)
 	}
 	return nil

@@ -26,6 +26,15 @@ type Probe struct {
 	Type ProbeType
 	// Exec is the command (and args) to run for ProbeTypeExec.
 	Exec []string
+	// ExecExpect, when non-empty, requires the probe's stdout to contain the
+	// substring for the probe to be ready (in addition to a zero exit code).
+	// This lets a command whose exit code is always zero still gate readiness,
+	// e.g. psql -c "select pg_is_in_recovery()" returning "f". When
+	// ExecExpectExact is set, the trimmed stdout must equal ExecExpect.
+	ExecExpect string
+	// ExecExpectExact, when true, requires the trimmed stdout to equal
+	// ExecExpect instead of merely containing it.
+	ExecExpectExact bool
 	// TCP holds the dial target for ProbeTypeTCP.
 	TCP TCPProbe
 	// HTTP holds the request target for ProbeTypeHTTP.

@@ -28,6 +28,12 @@ type ProcessNode struct {
 	// handling. It must be a leaf with no still-supervised siblings; the
 	// orchestrator returns an error otherwise. Mutually exclusive with Health.
 	Exec bool
+	// Scheduler, when set, makes this node a scheduled (cron-driven) process:
+	// the orchestrator runs the node's Process on each tick of Schedule rather
+	// than once at start. It is supervised and drained like a regular process.
+	// Mutually exclusive with Exec and Health (the orchestrator returns an
+	// error otherwise).
+	Scheduler *SchedulerConfig
 	// ForwardSignals lists the signal names to relay from ezx (PID 1) to this
 	// process's process group while it is supervised, e.g. ["SIGTERM",
 	// "SIGINT", "SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH"]. Empty means only

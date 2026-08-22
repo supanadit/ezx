@@ -3,6 +3,9 @@ package scriptmodules
 import (
 	"context"
 
+	"github.com/dop251/goja"
+	"github.com/labstack/echo/v4"
+
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/logger"
 	"github.com/supanadit/ezx/orchestrator"
@@ -13,14 +16,17 @@ import (
 //
 //	const { env, editor, process, log, chain, fs } = require("ezx");
 type EzxModule struct {
-	Env     *EnvModule     `goja:"env"`
-	Editor  *EditorModule  `goja:"editor"`
-	Process *ProcessModule `goja:"process"`
-	Log     *LogModule     `goja:"log"`
-	Chain   *ChainModule   `goja:"chain"`
-	FS      *FSModule      `goja:"fs"`
-	Health  *HealthModule  `goja:"health"`
-	Probe   *ProbeModule   `goja:"probe"`
+	Env       *EnvModule       `goja:"env"`
+	Editor    *EditorModule    `goja:"editor"`
+	Process   *ProcessModule   `goja:"process"`
+	Log       *LogModule       `goja:"log"`
+	Chain     *ChainModule     `goja:"chain"`
+	FS        *FSModule        `goja:"fs"`
+	Health    *HealthModule    `goja:"health"`
+	Probe     *ProbeModule     `goja:"probe"`
+	Scheduler *SchedulerModule `goja:"scheduler"`
+	API       *ApiModule       `goja:"api"`
+	YAML      *YamlModule      `goja:"yaml"`
 }
 
 // NewEzxModule builds the aggregate ezx module from the given dependencies.
@@ -33,15 +39,21 @@ func NewEzxModule(
 	factory ProcessFactory,
 	orch *orchestrator.Service,
 	health domain.HealthService,
+	e *echo.Echo,
+	rt *goja.Runtime,
 ) *EzxModule {
 	return &EzxModule{
-		Env:     NewEnvModule(),
-		Editor:  NewEditorModule(),
-		Process: NewProcessModule(ctx, factory),
-		Log:     NewLogModule(log),
-		Chain:   NewChainModule(ctx, orch),
-		FS:      NewFSModule(),
-		Health:  NewHealthModule(health),
-		Probe:   NewProbeModule(ctx),
+		Env:       NewEnvModule(),
+		Editor:    NewEditorModule(),
+		Process:   NewProcessModule(ctx, factory),
+		Log:       NewLogModule(log),
+		Chain:     NewChainModule(ctx, orch),
+		FS:        NewFSModule(),
+		Health:    NewHealthModule(health),
+		Probe:     NewProbeModule(ctx),
+		Scheduler: NewSchedulerModule(orch),
+		API:       NewApiModule(e, rt),
+		YAML:      NewYamlModule(),
 	}
 }
+

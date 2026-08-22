@@ -57,7 +57,6 @@ func main() {
 			orchestrator.NewService,
 			script.NewRegistry,
 			fx.Annotate(system.NewScriptEngine, fx.As(new(script.ScriptEngine))),
-			scriptmodules.NewEzxModule,
 		),
 		fx.Invoke(
 			terminal.NewBootstrapHandler,
