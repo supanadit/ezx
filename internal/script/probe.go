@@ -1,4 +1,4 @@
-package scriptmodules
+package script
 
 import (
 	"context"

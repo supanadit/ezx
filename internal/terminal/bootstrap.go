@@ -1,54 +1,31 @@
 package terminal
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/dop251/goja"
-	"github.com/labstack/echo/v4"
 	"github.com/spf13/cobra"
-
-	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/logger"
-	"github.com/supanadit/ezx/orchestrator"
-	"github.com/supanadit/ezx/script"
-	scriptmodules "github.com/supanadit/ezx/script/modules"
 )
 
-// BootstrapHandler wires the ezx bootstrap subcommand to the injected
-// Services. It constructs the aggregate host module and runs the user script
-// against the script engine, delegating all process orchestration to the
-// injected Services.
+// ScriptRunner is the local Port for executing a user entrypoint script
+// (R10). It is satisfied structurally by *runtime.Service; this handler never
+// imports a concrete engine or scripting technology.
+type ScriptRunner interface {
+	// RunFile loads and executes the script at path.
+	RunFile(ctx context.Context, path string) error
+}
+
+// BootstrapHandler wires the ezx bootstrap subcommand to the injected script
+// runner. It does protocol marshaling only: argument parsing and console
+// output. All orchestration happens inside the script via host modules.
 type BootstrapHandler struct {
-	proc     scriptmodules.ProcessFactory
-	orch     *orchestrator.Service
-	registry *script.Registry
-	engine   script.ScriptEngine
-	log      logger.Logger
-	health   domain.HealthService
-	router   *echo.Echo
+	runner ScriptRunner
 }
 
 // NewBootstrapHandler constructs the handler, registers the bootstrap
 // subcommand on rootCmd, and is invoked by the DI container.
-func NewBootstrapHandler(
-	rootCmd *cobra.Command,
-	proc scriptmodules.ProcessFactory,
-	orch *orchestrator.Service,
-	registry *script.Registry,
-	engine script.ScriptEngine,
-	log logger.Logger,
-	health domain.HealthService,
-	router *echo.Echo,
-) {
-	h := &BootstrapHandler{
-		proc:     proc,
-		orch:     orch,
-		registry: registry,
-		engine:   engine,
-		log:      log,
-		health:   health,
-		router:   router,
-	}
+func NewBootstrapHandler(rootCmd *cobra.Command, runner ScriptRunner) {
+	h := &BootstrapHandler{runner: runner}
 	rootCmd.AddCommand(h.bootstrapCmd())
 }
 
@@ -65,18 +42,12 @@ spawn processes, and drive the orchestrator.`,
 	}
 }
 
-// run loads the module registry, builds the aggregate ezx host module, and
-// executes the script against the engine. The command context carries the
-// app-level cancellation signal.
+// run executes the user script. The command context carries the app-level
+// cancellation signal.
 func (h *BootstrapHandler) run(cmd *cobra.Command, args []string) error {
 	path := args[0]
-
-	h.registry.Register("ezx", func(rt *goja.Runtime) any {
-		return scriptmodules.NewEzxModule(cmd.Context(), h.log, h.proc, h.orch, h.health, h.router, rt)
-	})
-
 	fmt.Printf("🚀 EZX bootstrapping %s\n", path)
-	if err := h.engine.RunFile(cmd.Context(), path); err != nil {
+	if err := h.runner.RunFile(cmd.Context(), path); err != nil {
 		fmt.Println("❌ EZX failed:", err)
 		return err
 	}

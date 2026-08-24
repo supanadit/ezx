@@ -1,4 +1,4 @@
-package scriptmodules
+package script
 
 import (
 	"fmt"
@@ -399,7 +399,7 @@ func splitRepeat(value any) []string {
 	}
 }
 
-// scalar converts a goja value to a string.
+// scalar converts a script-provided scalar value to a string.
 func scalar(v any) string {
 	switch t := v.(type) {
 	case nil:

@@ -1,7 +1,8 @@
-// Package scriptmodules provides the host modules exposed to user scripts
-// under the "ezx" namespace, e.g. require("ezx/log"). Each module is a Go
-// struct whose exported methods become the script-visible API.
-package scriptmodules
+// Package script is the JS delivery adapter: host modules exposed to user
+// scripts under the "ezx" namespace, e.g. require("ezx/log"). Each module is
+// a Go struct whose exported methods become the script-visible API. The
+// package is scripting-language agnostic — engine types never appear here.
+package script
 
 import (
 	"github.com/supanadit/ezx/logger"

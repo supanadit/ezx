@@ -1,4 +1,7 @@
-package system
+// helper.go — technology-specific helper for the js adapter (R4 subfolder
+// scope, R5-exempt: not a port implementation). It maps Go struct fields to
+// script-visible names for the goja runtime; only runtime.go consumes it.
+package js
 
 import (
 	"reflect"

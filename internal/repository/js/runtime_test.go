@@ -1,4 +1,4 @@
-package system
+package js
 
 import (
 	"bytes"
@@ -13,30 +13,45 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dop251/goja"
 	"github.com/labstack/echo/v4"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository/system"
+	"github.com/supanadit/ezx/internal/script"
+	"github.com/supanadit/ezx/logger"
 	"github.com/supanadit/ezx/orchestrator"
 	"github.com/supanadit/ezx/process"
-	"github.com/supanadit/ezx/script"
-	scriptmodules "github.com/supanadit/ezx/script/modules"
+	"github.com/supanadit/ezx/runtime"
 )
 
-// buildTestEngine wires a ScriptEngine with the env + editor host modules and a
-// capturing logger, for exercising host APIs from JS.
-func buildTestEngine(t *testing.T) (*ScriptEngine, *bytes.Buffer) {
-	t.Helper()
-	reg := script.NewRegistry()
-	var buf bytes.Buffer
-	log := NewLogger()
-	log.SetOutput(&buf)
-	reg.Register("ezx", func(rt *goja.Runtime) any {
-		return scriptmodules.NewEzxModule(context.Background(), log, func(node domain.ProcessNode) process.ProcessRepository {
-			return NewProcessRepository(node, nil)
-		}, nil, nil, nil, rt)
+// registerTestHostModule wires the aggregate ezx host module into reg using
+// the new Deps API; b.Invoker() provides callback support to ezx.api.
+func registerTestHostModule(reg *runtime.Registry, ctx context.Context, log logger.Logger, factory script.ProcessFactory, orch *orchestrator.Service, router *echo.Echo) {
+	reg.Register("ezx", func(b runtime.Binder) any {
+		return script.NewEzxModule(script.Deps{
+			Ctx:       ctx,
+			Log:       log,
+			Proc:      factory,
+			Chain:     orch,
+			Sched:     orch,
+			Routes:    router,
+			Callbacks: b.Invoker(),
+		})
 	})
-	return NewScriptEngine(reg), &buf
+}
+
+// buildTestEngine wires an Engine with the env + editor host modules and a
+// capturing logger, for exercising host APIs from JS.
+func buildTestEngine(t *testing.T) (*Engine, *bytes.Buffer) {
+	t.Helper()
+	reg := runtime.NewRegistry()
+	var buf bytes.Buffer
+	log := system.NewLogger()
+	log.SetOutput(&buf)
+	registerTestHostModule(reg, context.Background(), log, func(node domain.ProcessNode) process.ProcessRepository {
+		return system.NewProcessRepository(node, nil)
+	}, nil, nil)
+	return NewEngine(reg), &buf
 }
 
 func TestScriptEnvModule(t *testing.T) {
@@ -115,20 +130,18 @@ func TestScriptProcessModule(t *testing.T) {
 	}
 }
 
-// buildTestEngineWithRouter wires a ScriptEngine with the env + editor host
+// buildTestEngineWithRouter wires an Engine with the env + editor host
 // modules, a shared echo router (for ezx.api), and a capturing logger.
-func buildTestEngineWithRouter(t *testing.T, router *echo.Echo) (*ScriptEngine, *bytes.Buffer) {
+func buildTestEngineWithRouter(t *testing.T, router *echo.Echo) (*Engine, *bytes.Buffer) {
 	t.Helper()
-	reg := script.NewRegistry()
+	reg := runtime.NewRegistry()
 	var buf bytes.Buffer
-	log := NewLogger()
+	log := system.NewLogger()
 	log.SetOutput(&buf)
-	reg.Register("ezx", func(rt *goja.Runtime) any {
-		return scriptmodules.NewEzxModule(context.Background(), log, func(node domain.ProcessNode) process.ProcessRepository {
-			return NewProcessRepository(node, nil)
-		}, nil, nil, router, rt)
-	})
-	return NewScriptEngine(reg), &buf
+	registerTestHostModule(reg, context.Background(), log, func(node domain.ProcessNode) process.ProcessRepository {
+		return system.NewProcessRepository(node, nil)
+	}, nil, router)
+	return NewEngine(reg), &buf
 }
 
 func TestScriptSchedulerBuildAndAPI(t *testing.T) {
@@ -222,7 +235,7 @@ func (f *e2eFakeProc) Done() <-chan struct{}      { return f.done }
 func TestScriptEndToEndManualTrigger(t *testing.T) {
 	startC := make(chan string, 8)
 	router := echo.New()
-	log := NewLogger()
+	log := system.NewLogger()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -233,11 +246,9 @@ func TestScriptEndToEndManualTrigger(t *testing.T) {
 	}
 	orch := orchestrator.NewService(factory, log, nil)
 
-	reg := script.NewRegistry()
-	reg.Register("ezx", func(rt *goja.Runtime) any {
-		return scriptmodules.NewEzxModule(ctx, log, factory, orch, nil, router, rt)
-	})
-	engine := NewScriptEngine(reg)
+	reg := runtime.NewRegistry()
+	registerTestHostModule(reg, ctx, log, factory, orch, router)
+	engine := NewEngine(reg)
 
 	src := `
 		const { chain, scheduler, api } = require("ezx");

@@ -13,14 +13,15 @@ import (
 
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/health"
+	jsengine "github.com/supanadit/ezx/internal/repository/js"
 	"github.com/supanadit/ezx/internal/repository/system"
 	"github.com/supanadit/ezx/internal/rest"
+	"github.com/supanadit/ezx/internal/script"
 	"github.com/supanadit/ezx/internal/terminal"
 	"github.com/supanadit/ezx/logger"
 	"github.com/supanadit/ezx/orchestrator"
 	"github.com/supanadit/ezx/process"
-	"github.com/supanadit/ezx/script"
-	scriptmodules "github.com/supanadit/ezx/script/modules"
+	"github.com/supanadit/ezx/runtime"
 )
 
 func main() {
@@ -47,6 +48,10 @@ func main() {
 	app := fx.New(
 		fx.NopLogger,
 		fx.Supply(rootCmd),
+		// Provider (not Supply): fx keys dependencies by the declared return
+		// type, so this registers as context.Context; Supply would register
+		// signal.NotifyContext's unexported *signal.signalCtx instead.
+		fx.Provide(func() context.Context { return ctx }),
 		fx.Provide(
 			fx.Annotate(system.NewLogger, fx.As(new(logger.Logger))),
 			func() *system.Reaper { return reaper },
@@ -55,10 +60,14 @@ func main() {
 			provideProcessFactory,
 			provideScriptFactory,
 			orchestrator.NewService,
-			script.NewRegistry,
-			fx.Annotate(system.NewScriptEngine, fx.As(new(script.ScriptEngine))),
+			runtime.NewRegistry,
+			// Scripting-language adapter: swap jsengine for a lua engine (and
+			// its fx.As target stays runtime.Engine) to change languages.
+			fx.Annotate(jsengine.NewEngine, fx.As(new(runtime.Engine))),
+			fx.Annotate(runtime.NewService, fx.As(new(terminal.ScriptRunner))),
 		),
 		fx.Invoke(
+			registerHostModules,
 			terminal.NewBootstrapHandler,
 			rest.NewHealthHandler,
 			// Start the health server BEFORE running the root command: the
@@ -120,10 +129,35 @@ func provideProcessFactory(reaper *system.Reaper) orchestrator.ProcessFactory {
 	}
 }
 
-// provideScriptFactory provides the same per-node process factory typed for the
-// script host module, whose ProcessFactory is a distinct named type.
-func provideScriptFactory(reaper *system.Reaper) scriptmodules.ProcessFactory {
+// provideScriptFactory provides the same per-node process factory typed for
+// the script delivery, whose ProcessFactory is a distinct named type.
+func provideScriptFactory(reaper *system.Reaper) script.ProcessFactory {
 	return func(node domain.ProcessNode) process.ProcessRepository {
 		return system.NewProcessRepository(node, reaper)
 	}
+}
+
+// registerHostModules wires the aggregate ezx host module into the script
+// registry. It is pure composition: delivery types + module Ports only.
+func registerHostModules(
+	ctx context.Context,
+	log logger.Logger,
+	factory script.ProcessFactory,
+	orch *orchestrator.Service,
+	ready domain.HealthService,
+	e *echo.Echo,
+	reg *runtime.Registry,
+) {
+	reg.Register("ezx", func(b runtime.Binder) any {
+		return script.NewEzxModule(script.Deps{
+			Ctx:       ctx,
+			Log:       log,
+			Proc:      factory,
+			Chain:     orch,
+			Ready:     ready,
+			Sched:     orch,
+			Routes:    e,
+			Callbacks: b.Invoker(),
+		})
+	})
 }

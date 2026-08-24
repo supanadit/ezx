@@ -1,10 +1,20 @@
-package scriptmodules
+package script
 
 import (
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/internal/repository"
-	"github.com/supanadit/ezx/orchestrator"
 )
+
+// SchedulerControl is the local Port for triggering and observing scheduled
+// nodes (R10). It is satisfied structurally by *orchestrator.Service.
+type SchedulerControl interface {
+	// Trigger fires a scheduled node's tick immediately.
+	Trigger(name string) bool
+	// InFlight reports whether the node currently has a tick running.
+	InFlight(name string) bool
+	// Scheduled reports whether a scheduled node with the name exists.
+	Scheduled(name string) bool
+}
 
 // SchedulerModule exposes ezx.scheduler: a generic cron-driven scheduler.
 // Scripts attach a scheduler to a ProcessNode (node.scheduler = {...}) so the
@@ -21,13 +31,14 @@ import (
 //	scheduler.trigger("backup-full");   // manual fire-and-forget
 //	scheduler.status("backup-full");    // { exists, inflight }
 type SchedulerModule struct {
-	orch *orchestrator.Service
+	svc SchedulerControl
 }
 
-// NewSchedulerModule returns a SchedulerModule backed by the orchestrator, so
-// trigger/status reach the running scheduled nodes. orch may be nil in tests.
-func NewSchedulerModule(orch *orchestrator.Service) *SchedulerModule {
-	return &SchedulerModule{orch: orch}
+// NewSchedulerModule returns a SchedulerModule backed by the given control
+// port, so trigger/status reach the running scheduled nodes. svc may be nil
+// in tests.
+func NewSchedulerModule(svc SchedulerControl) *SchedulerModule {
+	return &SchedulerModule{svc: svc}
 }
 
 // Build validates the cron expression and returns the SchedulerConfig. It is
@@ -51,20 +62,20 @@ func (m *SchedulerModule) Parse(expr string) (string, error) {
 // a tick is already running). Returns false if no such node exists or it has
 // been drained.
 func (m *SchedulerModule) Trigger(name string) bool {
-	if m.orch == nil {
+	if m.svc == nil {
 		return false
 	}
-	return m.orch.Trigger(name)
+	return m.svc.Trigger(name)
 }
 
 // Status reports whether a scheduled node exists and whether it has a tick in
 // flight.
 func (m *SchedulerModule) Status(name string) map[string]any {
-	if m.orch == nil {
+	if m.svc == nil {
 		return map[string]any{"exists": false, "inflight": false}
 	}
 	return map[string]any{
-		"exists":   m.orch.Scheduled(name),
-		"inflight": m.orch.InFlight(name),
+		"exists":   m.svc.Scheduled(name),
+		"inflight": m.svc.InFlight(name),
 	}
 }
