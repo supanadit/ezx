@@ -5,7 +5,6 @@ import (
 
 	"github.com/supanadit/ezx/internal/repository"
 )
-
 // FSModule exposes ezx.fs: filesystem helpers for scripts. It enables the
 // container-entrypoint patterns the official docker entrypoints rely on —
 // first-run detection (PG_VERSION exists), directory permission setup
@@ -105,4 +104,76 @@ func (m *FSModule) Umask(mask int) int {
 // Rename renames (or moves) a path.
 func (m *FSModule) Rename(oldPath, newPath string) error {
 	return repository.Rename(oldPath, newPath)
+}
+
+// writeOpts holds optional mode/owner for fs.write and fs.ensureDir.
+type writeOpts struct {
+	// Mode is the permission bits to apply (e.g. 0o600).
+	Mode uint32
+	// Owner is a "user:group" or "user" chown target.
+	Owner string
+	// Recursive controls whether chown applies recursively (ensureDir only).
+	Recursive *bool
+}
+
+// Write writes content to path, creating/overwriting it and any missing parent
+// directories. With opts, it chmods to opts.Mode and chowns to opts.Owner after
+// writing.
+func (m *FSModule) Write(path, content string, opts ...writeOpts) (string, error) {
+	perm := os.FileMode(0o644)
+	var o writeOpts
+	if len(opts) > 0 {
+		o = opts[0]
+		if o.Mode != 0 {
+			perm = os.FileMode(o.Mode)
+		}
+	}
+	p, err := repository.WriteFile(path, []byte(content), perm)
+	if err != nil {
+		return "", err
+	}
+	if err := m.Chmod(p, uint32(perm)); err != nil {
+		return "", err
+	}
+	if o.Owner != "" {
+		if err := m.Chown(p, o.Owner); err != nil {
+			return "", err
+		}
+	}
+	return p, nil
+}
+
+// EnsureDir creates a directory (with parents) at path, applies opts.Mode, and
+// optionally chowns (recursively by default). Returns nothing on success.
+func (m *FSModule) EnsureDir(path string, opts ...writeOpts) error {
+	perm := os.FileMode(0o755)
+	var o writeOpts
+	if len(opts) > 0 {
+		o = opts[0]
+		if o.Mode != 0 {
+			perm = os.FileMode(o.Mode)
+		}
+	}
+	if err := m.MkdirAll(path, uint32(perm)); err != nil {
+		return err
+	}
+	if err := m.Chmod(path, uint32(perm)); err != nil {
+		return err
+	}
+	if o.Owner != "" {
+		recursive := true
+		if o.Recursive != nil {
+			recursive = *o.Recursive
+		}
+		if recursive {
+			return m.ChownRecursive(path, o.Owner)
+		}
+		return m.Chown(path, o.Owner)
+	}
+	return nil
+}
+
+// Which reports whether cmd resolves on PATH (command -v).
+func (m *FSModule) Which(cmd string) bool {
+	return repository.Which(cmd)
 }

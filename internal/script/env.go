@@ -1,7 +1,10 @@
 package script
 
 import (
+	"fmt"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/supanadit/ezx/internal/repository"
 )
@@ -65,4 +68,56 @@ func splitKV(kv string) (string, string, bool) {
 		}
 	}
 	return "", "", false
+}
+
+// Int reads an environment variable and parses it as an integer. If the
+// variable is unset/empty it returns def (throwing if no def is provided). A
+// non-integer value fails fast with an error rather than silently defaulting.
+func (m *EnvModule) Int(name string, def ...int) (int, error) {
+	v, ok := repository.Lookup(os.Environ(), name)
+	if !ok || v == "" {
+		if len(def) > 0 {
+			return def[0], nil
+		}
+		return 0, fmt.Errorf("env %q is not set", name)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return 0, fmt.Errorf("env %q=%q is not an integer", name, v)
+	}
+	return n, nil
+}
+
+// Bool reads an environment variable with truthy semantics and returns a real
+// Go bool (so JS sees true/false). When unset/empty and a default is provided,
+// the default determines the result; otherwise unset/empty is falsy.
+func (m *EnvModule) Bool(name string, def ...bool) bool {
+	if v, ok := repository.Lookup(os.Environ(), name); ok && v != "" {
+		return repository.IsTruthyValue(v)
+	}
+	if len(def) > 0 {
+		return def[0]
+	}
+	return false
+}
+
+// List reads an environment variable, splits it on sep, trims each element and
+// drops empties, returning the []string result. When unset/empty it returns def
+// (defaulting to an empty slice).
+func (m *EnvModule) List(name, sep string, def ...[]string) []string {
+	v, ok := repository.Lookup(os.Environ(), name)
+	if !ok || v == "" {
+		if len(def) > 0 {
+			return def[0]
+		}
+		return []string{}
+	}
+	var out []string
+	for _, part := range strings.Split(v, sep) {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }

@@ -110,7 +110,7 @@ The aggregate module exposed to scripts:
 | `config`    | Declarative config builder (`key=value`, tables, INI, fluent builder)         |
 | `yaml`      | Deterministic YAML serialization                                              |
 | `scheduler` | Cron-driven scheduled processes with gates                                    |
-| `health`    | Health/readiness HTTP server (`/readyz`) on `EZX_HEALTH_ADDR`                 |
+| `health`    | Health/readiness HTTP server (`/readyz`, `/livez`, `/healthz`) on `EZX_HEALTH_ADDR` (default `:8080`) |
 | `probe`     | exec / tcp / http readiness probes                                            |
 | `api`       | User-defined routes on the shared health server (e.g. manual backup trigger)  |
 | `log`       | Structured logging                                                            |

@@ -1,6 +1,7 @@
 package system
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -8,6 +9,13 @@ import (
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/internal/repository"
 )
+
+// maxCaptureBytes caps how much output a single stream buffers when routed to
+// LogDestCapture. Beyond this the buffer is truncated with a marker.
+const maxCaptureBytes = 1 << 20 // 1 MiB
+
+// captureMarker is appended when a capture buffer hits its cap.
+const captureMarker = "\n[ezx: output truncated at 1MiB]\n"
 
 // ProcessRepository implements the process.ProcessRepository Port for the local
 // OS. It is constructed per ProcessNode and is the handle to that process once
@@ -20,6 +28,11 @@ type ProcessRepository struct {
 	start  bool
 	reaper *Reaper
 	code   int
+
+	// stdoutBuf/stderrBuf buffer output when the node is started with
+	// LogDestCapture for the corresponding stream.
+	stdoutBuf bytes.Buffer
+	stderrBuf bytes.Buffer
 }
 
 // NewProcessRepository creates a handle for the given ProcessNode, reaping its
@@ -68,6 +81,8 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	switch lc.Stdout {
 	case domain.LogDestDiscard:
 		cmd.Stdout = nil
+	case domain.LogDestCapture:
+		cmd.Stdout = &cappedWriter{buf: &s.stdoutBuf}
 	case domain.LogDestStderr:
 		cmd.Stdout = os.Stderr
 	default: // LogDestStdout
@@ -76,6 +91,8 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	switch lc.Stderr {
 	case domain.LogDestDiscard:
 		cmd.Stderr = nil
+	case domain.LogDestCapture:
+		cmd.Stderr = &cappedWriter{buf: &s.stderrBuf}
 	default: // LogDestStderr
 		cmd.Stderr = os.Stderr
 	}
@@ -150,4 +167,45 @@ func (s *ProcessRepository) PID() int {
 // Done closes when the process exits.
 func (s *ProcessRepository) Done() <-chan struct{} {
 	return s.done
+}
+
+// Output returns the captured stdout and stderr for a process started with
+// LogDestCapture. Empty strings when capture was not requested.
+func (s *ProcessRepository) Output() (stdout, stderr string) {
+	return s.stdoutBuf.String(), s.stderrBuf.String()
+}
+
+// cappedWriter writes into a bytes.Buffer up to maxCaptureBytes, then truncates
+// and appends a marker so unbounded process output cannot exhaust memory.
+type cappedWriter struct {
+	buf *bytes.Buffer
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	free := maxCaptureBytes - w.buf.Len()
+	if free > 0 {
+		n := len(p)
+		if n > free {
+			n = free
+		}
+		w.buf.Write(p[:n])
+		if n < len(p) {
+			w.truncate()
+		}
+	}
+	return len(p), nil
+}
+
+// truncate keeps the first maxCaptureBytes of the buffer and appends a marker
+// indicating output was cut.
+func (w *cappedWriter) truncate() {
+	keep := maxCaptureBytes - len(captureMarker)
+	if keep < 0 {
+		keep = 0
+	}
+	w.buf.Truncate(keep)
+	w.buf.WriteString(captureMarker)
+	if w.buf.Len() > maxCaptureBytes {
+		w.buf.Truncate(maxCaptureBytes)
+	}
 }

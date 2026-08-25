@@ -35,6 +35,11 @@ type SchedulerConfig struct {
 	// MaxRetries caps consecutive per-tick restarts of the tick process;
 	// <=0 means unlimited (the tick process is restarted on failure).
 	MaxRetries int
+	// Tick, when set, runs a Go callback on each tick instead of spawning the
+	// node's Process. Go-only (not serializable); the script delivery layer
+	// binds it from a JS function via the runtime invoker. Used by
+	// scheduler.every. It must be short and non-blocking.
+	Tick func()
 }
 
 // Trigger is a handle to fire a scheduled node's tick action immediately,

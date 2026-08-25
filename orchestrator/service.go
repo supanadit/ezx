@@ -161,6 +161,9 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 		return err
 	}
 	s.log.Info("[%s] started (pid=%d)", node.Name, proc.PID())
+	if node.OnStart != nil {
+		node.OnStart()
+	}
 
 	// Relay selected signals from ezx (PID 1) to the child process group.
 	var fwd *repository.Forwarder
@@ -192,8 +195,22 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 		defer pollCancel()
 	}
 
-	// Wait for readiness before exposing to children that need it.
-	if node.Readiness != nil {
+	// Wait for readiness before returning to children that may need it. A
+	// JS-driven ReadinessFunc overrides the declarative Readiness probe; both
+	// then set the health/readiness state and fire OnReady identically.
+	if node.ReadinessFunc != nil {
+		s.log.Info("[%s] waiting for readiness (callback)", node.Name)
+		ready := s.pollReadinessFunc(ctx, node)
+		if !ready {
+			s.log.Error("[%s] never became ready", node.Name)
+		}
+		if node.Health != nil && s.health != nil {
+			s.health.SetReady(ready)
+		}
+		if ready && node.OnReady != nil {
+			node.OnReady()
+		}
+	} else if node.Readiness != nil {
 		s.log.Info("[%s] waiting for readiness", node.Name)
 		ready, err := repository.Check(ctx, *node.Readiness)
 		if err != nil {
@@ -204,6 +221,9 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 		}
 		if node.Health != nil && s.health != nil {
 			s.health.SetReady(ready)
+		}
+		if ready && node.OnReady != nil {
+			node.OnReady()
 		}
 	}
 
@@ -254,6 +274,10 @@ func (s *Service) spawnChildren(ctx context.Context, node domain.ProcessNode, ne
 		go func(c domain.ProcessNode) {
 			defer wg.Done()
 			if err := s.runNode(ctx, c, false); err != nil {
+				if c.Optional {
+					s.log.Warn("[%s] optional child failed (non-fatal): %v", c.Name, err)
+					return
+				}
 				select {
 				case errCh <- err:
 					cancel()
@@ -262,6 +286,46 @@ func (s *Service) spawnChildren(ctx context.Context, node domain.ProcessNode, ne
 			}
 		}(child)
 	}
+}
+
+// pollReadinessFunc polls the node's ReadinessFunc callback until it returns
+// true or ctx is cancelled. When node.Readiness is set its Interval/Timeout and
+// MaxAttempts are honored (MaxAttempts <= 0 means poll until ctx is cancelled);
+// otherwise it defaults to polling every second until ctx is cancelled.
+func (s *Service) pollReadinessFunc(ctx context.Context, node domain.ProcessNode) bool {
+	interval := time.Second
+	maxAttempts := 0
+	if node.Readiness != nil {
+		if node.Readiness.Interval > 0 {
+			interval = node.Readiness.Interval
+		}
+		if node.Readiness.Timeout > 0 {
+			maxAttempts = int(node.Readiness.Timeout / interval)
+			if maxAttempts <= 0 {
+				maxAttempts = 1
+			}
+		} else if node.Readiness.MaxAttempts > 0 {
+			maxAttempts = node.Readiness.MaxAttempts
+		}
+	}
+	for attempt := 0; maxAttempts <= 0 || attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		if node.ReadinessFunc() {
+			return true
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+	return false
 }
 
 // pollReadiness polls the probe and reports readiness on the health service
@@ -312,14 +376,17 @@ func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc p
 		case <-proc.Done():
 			code, err := proc.Wait()
 			s.log.Info("[%s] process exited (code=%d)", node.Name, code)
+			if node.OnExit != nil {
+				node.OnExit(code)
+			}
 
 			shouldRestart := s.shouldRestart(node, code)
 			if !shouldRestart {
-				return err
+				return s.exitCodeErr(code, err)
 			}
 			if node.Restart != nil && node.Restart.MaxRetries > 0 && retries >= node.Restart.MaxRetries {
 				s.log.Warn("[%s] restart retries exhausted", node.Name)
-				return err
+				return s.exitCodeErr(code, err)
 			}
 			retries++
 			backoff := s.backoff(node)
@@ -338,6 +405,17 @@ func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc p
 			s.log.Info("[%s] restarted (pid=%d)", node.Name, proc.PID())
 		}
 	}
+}
+
+// exitCodeErr returns err unwrapped, or an *ExitError carrying the process
+// exit code when the process exited non-zero and err does not already carry a
+// meaningful code (reaper-backed Wait returns (code, nil)). This lets the app
+// exit the container with the supervised main process's code.
+func (s *Service) exitCodeErr(code int, err error) error {
+	if code != 0 {
+		return &domain.ExitError{Code: code}
+	}
+	return err
 }
 
 func (s *Service) shouldRestart(node domain.ProcessNode, code int) bool {
@@ -550,6 +628,13 @@ func (s *Service) runTick(ctx context.Context, node domain.ProcessNode, shutdown
 
 	s.beginActive()
 	defer s.endActive()
+
+	// A callback tick (scheduler.every) runs the Go/JS callback instead of
+	// spawning the node's Process. It is short and non-blocking by contract.
+	if node.Scheduler.Tick != nil {
+		node.Scheduler.Tick()
+		return nil
+	}
 
 	proc := s.proc(node)
 	s.log.Info("[%s] tick starting (pid=%d)", node.Name, proc.PID())

@@ -226,6 +226,7 @@ func (f *e2eFakeProc) Signal(os.Signal) error     { return nil }
 func (f *e2eFakeProc) Kill() error                { return nil }
 func (f *e2eFakeProc) PID() int                   { return 1 }
 func (f *e2eFakeProc) Done() <-chan struct{}      { return f.done }
+func (f *e2eFakeProc) Output() (string, string)   { return "", "" }
 
 // TestScriptEndToEndManualTrigger runs the real flow: a JS script registers a
 // user-defined route, then chain.run's a scheduled node (blocking). The test
@@ -310,6 +311,266 @@ func TestScriptEndToEndManualTrigger(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("RunString did not return after cancel")
+	}
+}
+
+func TestScriptProcessRunCapture(t *testing.T) {
+	engine, _ := buildTestEngine(t)
+
+	src := `
+		const { process } = require("ezx");
+		// run returns exit code.
+		const c = process.run({ name: "sh", process: { binaryPath: "/bin/sh", arguments: ["-c", "exit 3"] } });
+		if (c !== 3) throw new Error("run expected exit 3, got " + c);
+		// run with check throws on non-zero.
+		let threw = false;
+		try { process.run({ process: { binaryPath: "/bin/sh", arguments: ["-c", "exit 1"] }, check: true }); }
+		catch (e) { threw = true; }
+		if (!threw) throw new Error("run check should throw on non-zero");
+		// capture returns { code, stdout, stderr }.
+		const cap = process.capture({ process: { binaryPath: "/bin/echo", arguments: ["hello"] } });
+		if (cap.code !== 0) throw new Error("capture code = " + cap.code);
+		if (cap.stdout !== "hello\n") throw new Error("capture stdout = " + JSON.stringify(cap.stdout));
+		// capture with check throws on non-zero including stderr.
+		threw = false;
+		try { process.capture({ process: { binaryPath: "/bin/sh", arguments: ["-c", "echo oops >&2; exit 2"] }, check: true }); }
+		catch (e) { threw = true; }
+		if (!threw) throw new Error("capture check should throw on non-zero");
+	`
+	if err := engine.RunString(context.Background(), src); err != nil {
+		t.Fatalf("RunString: %v", err)
+	}
+}
+
+func TestScriptProcessShellAndShellQuote(t *testing.T) {
+	engine, _ := buildTestEngine(t)
+
+	src := `
+		const { process, shell } = require("ezx");
+		const c = process.shell("exit 0", {});
+		if (c !== 0) throw new Error("shell exit = " + c);
+		let threw = false;
+		try { process.shell("exit 7", { check: true }); } catch (e) { threw = true; }
+		if (!threw) throw new Error("shell check should throw on non-zero");
+		const q = shell.quote("it's a value");
+		if (q !== "'it'\\''s a value'") throw new Error("quote wrong: " + q);
+	`
+	if err := engine.RunString(context.Background(), src); err != nil {
+		t.Fatalf("RunString: %v", err)
+	}
+}
+
+func TestScriptFSWriteEnsureDirWhich(t *testing.T) {
+	dir := t.TempDir()
+	engine, _ := buildTestEngine(t)
+
+	path := filepath.Join(dir, "sub", "f.txt")
+	src := fmt.Sprintf(`
+		const { fs } = require("ezx");
+		fs.write(%q, "content");
+		const info = fs.stat(%q);
+		if (info.name !== "f.txt") throw new Error("stat name = " + info.name);
+		fs.ensureDir(%q, { mode: 0o700 });
+		if (!fs.exists(%q)) throw new Error("ensureDir did not create dir");
+		if (!fs.which("sh")) throw new Error("which(sh) should be true");
+		if (fs.which("ezx-no-such-binary")) throw new Error("which(bogus) should be false");
+	`, path, path, filepath.Join(dir, "a", "b"), filepath.Join(dir, "a", "b"))
+	if err := engine.RunString(context.Background(), src); err != nil {
+		t.Fatalf("RunString: %v", err)
+	}
+}
+
+func TestScriptEnvIntBoolList(t *testing.T) {
+	t.Setenv("EZX_JS_INT", "42")
+	t.Setenv("EZX_JS_BOOL", "true")
+	t.Setenv("EZX_JS_LIST", "a, b,,c")
+	engine, _ := buildTestEngine(t)
+
+	src := `
+		const { env } = require("ezx");
+		if (env.int("EZX_JS_INT") !== 42) throw new Error("int failed");
+		if (env.int("EZX_JS_INT_UNSET", 7) !== 7) throw new Error("int default failed");
+		let threw = false;
+		try { env.int("EZX_JS_BAD"); } catch (e) { threw = true; }
+		if (!threw) throw new Error("int non-integer should throw");
+		if (env.bool("EZX_JS_BOOL") !== true) throw new Error("bool failed: " + env.bool("EZX_JS_BOOL"));
+		if (env.bool("EZX_JS_UNSET") !== false) throw new Error("bool unset should be false");
+		if (env.bool("EZX_JS_UNSET", true) !== true) throw new Error("bool default true failed");
+		const l = env.list("EZX_JS_LIST", ",");
+		if (l.length !== 3 || l[0] !== "a" || l[1] !== "b" || l[2] !== "c") throw new Error("list failed: " + JSON.stringify(l));
+	`
+	if err := engine.RunString(context.Background(), src); err != nil {
+		t.Fatalf("RunString: %v", err)
+	}
+}
+
+// TestScriptSchedulerEvery verifies scheduler.every returns a valid
+// SchedulerConfig and that a callback tick does not spawn a process.
+func TestScriptSchedulerEvery(t *testing.T) {
+	startC := make(chan string, 8)
+	router := echo.New()
+	log := system.NewLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	factory := func(node domain.ProcessNode) process.ProcessRepository {
+		return &e2eFakeProc{name: node.Name, startC: startC, done: make(chan struct{})}
+	}
+	orch := orchestrator.NewService(factory, log, nil)
+
+	reg := runtime.NewRegistry()
+	registerTestHostModule(reg, ctx, log, factory, orch, router)
+	engine := NewEngine(reg)
+
+	// every() returns a config with a JS callback tick; the callback sets a
+	// global side effect. chain.run supervises the scheduled node.
+	src := `
+		const { chain, scheduler } = require("ezx");
+		const sched = scheduler.every("*/1 * * * *", () => { globalThis.__ticked = true; }, { minInterval: 1e0 });
+		chain.run({ roots: [{
+			name: "every-job",
+			process: { binaryPath: "/bin/true" },
+			scheduler: sched,
+		}] });
+	`
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- engine.RunString(ctx, src) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !orch.Scheduled("every-job") {
+		if time.Now().After(deadline) {
+			t.Fatal("scheduled node never registered")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Fire a manual trigger; the callback (not a process spawn) should run.
+	if !orch.Trigger("every-job") {
+		t.Fatal("Trigger(every-job) returned false")
+	}
+
+	// A callback tick must NOT spawn a process. Give the tick a moment.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case n := <-startC:
+		t.Fatalf("callback tick should not spawn a process, but %q started", n)
+	default:
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !strings.Contains(err.Error(), "context cancelled") {
+			t.Fatalf("RunString returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("RunString did not return after cancel")
+	}
+}
+
+// TestScriptLifecycleCallbacks verifies onStart/onExit fire through the
+// orchestrator. Each callback writes a marker file so the Go test can observe
+// the side effect deterministically.
+func TestScriptLifecycleCallbacks(t *testing.T) {
+	dir := t.TempDir()
+	startMarker := filepath.Join(dir, "onstart")
+	exitMarker := filepath.Join(dir, "onexit")
+	router := echo.New()
+	log := system.NewLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	factory := func(node domain.ProcessNode) process.ProcessRepository {
+		return &e2eFakeProc{name: node.Name, startC: make(chan string, 8), done: make(chan struct{})}
+	}
+	orch := orchestrator.NewService(factory, log, nil)
+
+	reg := runtime.NewRegistry()
+	registerTestHostModule(reg, ctx, log, factory, orch, router)
+	engine := NewEngine(reg)
+
+	// The fake proc exits immediately, so onStart fires after start and onExit
+	// after the process exits. Callbacks write marker files via fs.write. A
+	// restart policy opts the lone leaf out of the exec default so it stays
+	// supervised.
+	src := fmt.Sprintf(`
+		const { chain, fs } = require("ezx");
+		chain.run({ roots: [{
+			name: "cb-node",
+			process: { binaryPath: "/bin/true" },
+			restart: { mode: "never" },
+			onStart: () => { fs.write(%q, "1"); },
+			onExit: (code) => { fs.write(%q, String(code)); },
+		}] });
+	`, startMarker, exitMarker)
+
+	if err := engine.RunString(context.Background(), src); err != nil {
+		t.Fatalf("RunString: %v", err)
+	}
+
+	if !scriptTestFileExists(startMarker) {
+		t.Fatal("onStart callback did not fire (marker missing)")
+	}
+	if !scriptTestFileExists(exitMarker) {
+		t.Fatal("onExit callback did not fire (marker missing)")
+	}
+}
+
+func scriptTestFileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// TestScriptReadinessFunc verifies that a JS `readiness: () => ...` property on
+// a node binds to the Go ReadinessFunc callback and gates a needParentReady
+// child: the child starts only after the callback returns true.
+func TestScriptReadinessFunc(t *testing.T) {
+	startC := make(chan string, 8)
+	router := echo.New()
+	log := system.NewLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	factory := func(node domain.ProcessNode) process.ProcessRepository {
+		return &e2eFakeProc{name: node.Name, startC: startC, done: make(chan struct{})}
+	}
+	orch := orchestrator.NewService(factory, log, nil)
+
+	reg := runtime.NewRegistry()
+	registerTestHostModule(reg, ctx, log, factory, orch, router)
+	engine := NewEngine(reg)
+
+	// readiness returns false once, then true. The needParentReady child must
+	// only start after the callback returns true (i.e. after the parent).
+	src := `
+		const { chain } = require("ezx");
+		let calls = 0;
+		chain.run({ roots: [{
+			name: "pg",
+			process: { binaryPath: "/bin/true" },
+			restart: { mode: "never" },
+			readiness: () => { calls++; return calls >= 2; },
+			children: [{ name: "sidecar", needParentReady: true, process: { binaryPath: "/bin/true" } }],
+		}] });
+	`
+
+	if err := engine.RunString(context.Background(), src); err != nil {
+		t.Fatalf("RunString: %v", err)
+	}
+
+	// Both processes must start, parent before child (child gated on readiness).
+	var order []string
+	for i := 0; i < 2; i++ {
+		select {
+		case n := <-startC:
+			order = append(order, n)
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for starts")
+		}
+	}
+	if len(order) != 2 || order[0] != "pg" || order[1] != "sidecar" {
+		t.Fatalf("start order = %v, want [pg sidecar]", order)
 	}
 }
 

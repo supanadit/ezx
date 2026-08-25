@@ -70,7 +70,7 @@ if (!databaseAlreadyExists) {
   editor.open("/tmp/ezx-pwfile").replace((POSTGRES_PASSWORD || "") + "\n");
 
   log.info("Running initdb as user %s", POSTGRES_USER);
-  const initdb = process.spawn({
+  process.run({
     name: "initdb",
     process: {
       binaryPath: env.get("EZX_POSTGRES_BIN", "/usr/local/bin/initdb"),
@@ -78,10 +78,8 @@ if (!databaseAlreadyExists) {
       user: POSTGRES_USER,           // privilege drop (Phase B)
       group: POSTGRES_USER,
     },
+    check: true,
   });
-  initdb.start([]);
-  const initCode = initdb.wait();
-  if (initCode !== 0) throw new Error("initdb failed with exit code " + initCode);
   fs.remove("/tmp/ezx-pwfile");
 
   // ---- pg_setup_hba_conf -----------------------------------------------------
@@ -113,7 +111,7 @@ if (!databaseAlreadyExists) {
 
   // ---- docker_setup_db --------------------------------------------------------
   const psqlArgs = ["--username", POSTGRES_USER, "--dbname", POSTGRES_DB];
-  const psql = process.spawn({
+  process.run({
     name: "psql-setup",
     process: {
       binaryPath: "/usr/bin/psql",
@@ -122,8 +120,6 @@ if (!databaseAlreadyExists) {
       user: POSTGRES_USER,
     },
   });
-  psql.start([]);
-  psql.wait();
 
   // ---- docker_process_init_files (sorted .sql / .sh) ---------------------------
   const initDir = "/docker-entrypoint-initdb.d";
@@ -132,7 +128,7 @@ if (!databaseAlreadyExists) {
       const full = initDir + "/" + name;
       if (name.endsWith(".sql")) {
         log.info("running %s", full);
-        const runner = process.spawn({
+        process.run({
           name: "init-" + name,
           process: {
             binaryPath: "/usr/bin/psql",
@@ -140,13 +136,11 @@ if (!databaseAlreadyExists) {
             environment: ["PGPASSWORD=" + (POSTGRES_PASSWORD || "")],
             user: POSTGRES_USER,
           },
+          check: true,
         });
-        runner.start([]);
-        const rc = runner.wait();
-        if (rc !== 0) throw new Error("init script " + name + " failed with " + rc);
       } else if (name.endsWith(".sql.gz")) {
         log.info("running (gzip) %s", full);
-        const gunzip = process.spawn({
+        process.run({
           name: "gunzip-" + name,
           process: {
             binaryPath: "/bin/sh",
@@ -154,21 +148,19 @@ if (!databaseAlreadyExists) {
             environment: ["PGPASSWORD=" + (POSTGRES_PASSWORD || "")],
             user: POSTGRES_USER,
           },
+          check: true,
         });
-        gunzip.start([]);
-        if (gunzip.wait() !== 0) throw new Error("init script " + name + " failed");
       } else if (name.endsWith(".sh")) {
         log.info("running (shell) %s", full);
-        const shell = process.spawn({
+        process.run({
           name: "sh-" + name,
           process: {
             binaryPath: "/bin/sh",
             arguments: [full],
             user: POSTGRES_USER,
           },
+          check: true,
         });
-        shell.start([]);
-        if (shell.wait() !== 0) throw new Error("init script " + name + " failed");
       }
     }
   }

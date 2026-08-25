@@ -29,4 +29,7 @@ type ProcessRepository interface {
 	PID() int
 	// Done closes when the process exits. It is safe to select on.
 	Done() <-chan struct{}
+	// Output returns the captured stdout and stderr for a process started with
+	// LogDestCapture. Empty strings when capture was not requested.
+	Output() (stdout, stderr string)
 }

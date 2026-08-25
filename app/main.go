@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -80,6 +81,10 @@ func main() {
 	)
 
 	if err := app.Start(ctx); err != nil {
+		var ee *domain.ExitError
+		if errors.As(err, &ee) {
+			os.Exit(ee.Code)
+		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -90,12 +95,12 @@ func main() {
 	}
 }
 
-// startHealthServer starts the process-wide health HTTP server when
-// EZX_HEALTH_ADDR is set.
+// startHealthServer always starts the process-wide health HTTP server,
+// defaulting the listen address to :8080 when EZX_HEALTH_ADDR is unset.
 func startHealthServer(e *echo.Echo, lc fx.Lifecycle) {
 	addr := os.Getenv("EZX_HEALTH_ADDR")
 	if addr == "" {
-		return
+		addr = ":8080"
 	}
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -57,6 +58,9 @@ func (f *fakeProc) Signal(os.Signal) error { return nil }
 func (f *fakeProc) Kill() error            { return nil }
 func (f *fakeProc) PID() int               { return 1 }
 func (f *fakeProc) Done() <-chan struct{}  { return f.done }
+func (f *fakeProc) Output() (string, string) {
+	return "", ""
+}
 
 // fakeLogger implements logger.Logger.
 type fakeLogger struct{}
@@ -80,6 +84,204 @@ func newTestService(procs map[string]*fakeProc) *Service {
 
 var _ logger.Logger = (*fakeLogger)(nil)
 var _ process.ProcessRepository = (*fakeProc)(nil)
+
+// TestRunOptionalChildNonFatal verifies that an Optional child that exits
+// non-zero does NOT cancel the parent tree and does not surface an error from
+// chain.Run. The parent keeps running to completion; the child's failure is
+// swallowed (logged only).
+func TestRunOptionalChildNonFatal(t *testing.T) {
+	startC := make(chan string, 10)
+	parent := newFakeProc("parent", 0, startC)
+	child := newFakeProc("sidecar", 1, startC)
+	parent.delay = 200 * time.Millisecond
+	child.delay = 50 * time.Millisecond
+	procs := map[string]*fakeProc{"parent": parent, "sidecar": child}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "parent",
+				Children: []domain.ProcessNode{
+					{Name: "sidecar", Optional: true},
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// The optional child exits non-zero but Run must NOT propagate an error.
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run returned error for non-fatal optional child: %v", err)
+	}
+}
+
+// TestRunNonOptionalChildFatal verifies the existing behavior is preserved: a
+// child that is NOT Optional and exits non-zero still cancels the tree and
+// surfaces an error from chain.Run.
+func TestRunNonOptionalChildFatal(t *testing.T) {
+	startC := make(chan string, 10)
+	parent := newFakeProc("parent", 0, startC)
+	child := newFakeProc("child", 5, startC)
+	parent.delay = 500 * time.Millisecond
+	child.delay = 50 * time.Millisecond
+	procs := map[string]*fakeProc{"parent": parent, "child": child}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "parent",
+				Children: []domain.ProcessNode{
+					{Name: "child"},
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err == nil {
+		t.Fatal("Run returned nil, want *domain.ExitError from non-optional child")
+	}
+}
+
+// TestRunOptionalChildAfterNeedReady verifies an Optional needParentReady child
+// that exits non-zero does not cancel the parent, mirroring the sidecar
+// topology (postgres + optional pgbouncer/sshd).
+func TestRunOptionalChildAfterNeedReady(t *testing.T) {
+	startC := make(chan string, 10)
+	parent := newFakeProc("parent", 0, startC)
+	child := newFakeProc("sidecar", 3, startC)
+	parent.delay = 300 * time.Millisecond
+	child.delay = 50 * time.Millisecond
+	procs := map[string]*fakeProc{"parent": parent, "sidecar": child}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "parent",
+				Children: []domain.ProcessNode{
+					{Name: "sidecar", NeedParentReady: true, Optional: true},
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run returned error for non-fatal optional child: %v", err)
+	}
+}
+
+func TestLifecycleCallbacks(t *testing.T) {
+	startC := make(chan string, 10)
+	var mu sync.Mutex
+	onStart := 0
+	onExit := []int{}
+	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 3, startC)}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name: "svc",
+				Restart: &domain.RestartPolicy{
+					Mode:      domain.RestartNever,
+					MaxRetries: 1,
+				},
+				OnStart: func() {
+					mu.Lock()
+					onStart++
+					mu.Unlock()
+				},
+				OnExit: func(code int) {
+					mu.Lock()
+					onExit = append(onExit, code)
+					mu.Unlock()
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := svc.Run(ctx, chain)
+	// The supervised process exits non-zero (3) with RestartNever, so Run must
+	// propagate it as an ExitError (the container should exit with that code).
+	var ee *domain.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("Run: %v, want *domain.ExitError", err)
+	}
+	if ee.Code != 3 {
+		t.Fatalf("ExitError.Code = %d, want 3", ee.Code)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if onStart != 1 {
+		t.Fatalf("onStart fired %d times, want 1", onStart)
+	}
+	if len(onExit) != 1 || onExit[0] != 3 {
+		t.Fatalf("onExit = %v, want [3]", onExit)
+	}
+}
+
+func TestScheduledNodeCallbackTick(t *testing.T) {
+	procs := map[string]*fakeProc{}
+	svc := newTestService(procs)
+
+	var mu sync.Mutex
+	ticks := 0
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name:    "job",
+				Process: domain.Process{BinaryPath: "/bin/true"},
+				Scheduler: &domain.SchedulerConfig{
+					Schedule:    domain.CronSchedule{Expression: "0 0 1 1 *"},
+					MinInterval: time.Nanosecond,
+					Tick: func() {
+						mu.Lock()
+						ticks++
+						mu.Unlock()
+					},
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- svc.Run(ctx, chain) }()
+	waitScheduled(t, svc, "job")
+
+	if !svc.Trigger("job") {
+		t.Fatal("Trigger(job) returned false")
+	}
+	// A callback tick must not spawn a process; wait for it to run.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := ticks
+		mu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	mu.Lock()
+	if ticks == 0 {
+		t.Fatal("callback tick never ran")
+	}
+	mu.Unlock()
+
+	cancel()
+	<-runDone
+}
 
 func TestRunStartsNeedReadyChildAfterParent(t *testing.T) {
 	startC := make(chan string, 10)
@@ -387,4 +589,159 @@ func TestScheduledNodeUnknownTriggerAndGateSkip(t *testing.T) {
 
 	cancel()
 	<-runDone
+}
+
+// TestRunNonZeroExitPropagates verifies that a node with no restart policy
+// whose process exits non-zero makes chain.Run return an error that
+// errors.As-matches *domain.ExitError with the right code.
+func TestRunNonZeroExitPropagates(t *testing.T) {
+	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 7, nil)}
+	svc := newTestService(procs)
+
+	// A non-nil Restart policy keeps the lone leaf root supervised instead of
+	// exec'ing; RestartNever means the process is not restarted on exit.
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{{
+			Name:    "svc",
+			Restart: &domain.RestartPolicy{Mode: domain.RestartNever},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := svc.Run(ctx, chain)
+	if err == nil {
+		t.Fatal("Run returned nil, want *domain.ExitError")
+	}
+	var ee *domain.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("Run error %v does not match *domain.ExitError", err)
+	}
+	if ee.Code != 7 {
+		t.Fatalf("ExitError.Code = %d, want 7", ee.Code)
+	}
+}
+
+// TestRunZeroExitNoError verifies that a process exiting 0 returns nil from
+// Run (no ExitError).
+func TestRunZeroExitNoError(t *testing.T) {
+	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 0, nil)}
+	svc := newTestService(procs)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, domain.ProcessChain{
+		Roots: []domain.ProcessNode{{
+			Name:    "svc",
+			Restart: &domain.RestartPolicy{Mode: domain.RestartNever},
+		}},
+	}); err != nil {
+		t.Fatalf("Run returned error for exit-0 process: %v", err)
+	}
+}
+
+// TestRunReadinessFuncBecomesReady verifies that a node with a ReadinessFunc
+// that returns false a few times and then true starts its process and fires
+// OnReady once the callback reports ready.
+func TestRunReadinessFuncBecomesReady(t *testing.T) {
+	startC := make(chan string, 10)
+	parent := newFakeProc("parent", 0, startC)
+	child := newFakeProc("child", 0, startC)
+	parent.delay = 300 * time.Millisecond
+	child.delay = 300 * time.Millisecond
+	procs := map[string]*fakeProc{"parent": parent, "child": child}
+	svc := newTestService(procs)
+
+	var mu sync.Mutex
+	readyCalls := 0
+	onReady := 0
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{{
+			Name:     "parent",
+			Children: []domain.ProcessNode{{Name: "child", NeedParentReady: true}},
+			Readiness: &domain.Probe{Interval: time.Millisecond, MaxAttempts: 100},
+			ReadinessFunc: func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				readyCalls++
+				return readyCalls >= 3
+			},
+			OnReady: func() {
+				mu.Lock()
+				onReady++
+				mu.Unlock()
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	if onReady != 1 {
+		mu.Unlock()
+		t.Fatalf("OnReady fired %d times, want 1", onReady)
+	}
+	mu.Unlock()
+
+	// The child must have started only after the parent became ready.
+	var order []string
+	for i := 0; i < 2; i++ {
+		select {
+		case n := <-startC:
+			order = append(order, n)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for starts")
+		}
+	}
+	if len(order) != 2 || order[0] != "parent" || order[1] != "child" {
+		t.Fatalf("start order = %v, want [parent child]", order)
+	}
+}
+
+// TestRunReadinessFuncNeverReadySpawnsChildren verifies that a ReadinessFunc
+// that always returns false with a bounded MaxAttempts hits the "never became
+// ready" path yet still spawns needParentReady children, matching the probe
+// path's behavior.
+func TestRunReadinessFuncNeverReadySpawnsChildren(t *testing.T) {
+	startC := make(chan string, 10)
+	parent := newFakeProc("parent", 0, startC)
+	child := newFakeProc("child", 0, startC)
+	parent.delay = 200 * time.Millisecond
+	child.delay = 200 * time.Millisecond
+	procs := map[string]*fakeProc{"parent": parent, "child": child}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{{
+			Name:     "parent",
+			Children: []domain.ProcessNode{{Name: "child", NeedParentReady: true}},
+			Readiness: &domain.Probe{Interval: time.Millisecond, MaxAttempts: 2},
+			ReadinessFunc: func() bool {
+				return false
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var order []string
+	for i := 0; i < 2; i++ {
+		select {
+		case n := <-startC:
+			order = append(order, n)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for starts")
+		}
+	}
+	if len(order) != 2 || order[0] != "parent" || order[1] != "child" {
+		t.Fatalf("start order = %v, want [parent child]", order)
+	}
 }

@@ -94,6 +94,9 @@ const (
 	LogDestStderr LogDest = "stderr"
 	// LogDestDiscard discards process output.
 	LogDestDiscard LogDest = "discard"
+	// LogDestCapture buffers process output for later retrieval via
+	// ProcessRepository.Output. Used by one-shot capture (process.capture).
+	LogDestCapture LogDest = "capture"
 )
 
 // LogConfig controls how a spawned process's output is routed.

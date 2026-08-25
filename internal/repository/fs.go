@@ -2,6 +2,7 @@ package repository
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"time"
@@ -146,6 +147,26 @@ func RemoveAll(path string) error {
 // Rename renames (or moves) a path.
 func Rename(oldPath, newPath string) error {
 	return os.Rename(oldPath, newPath)
+}
+
+// WriteFile writes data to path, creating missing parent directories first. It
+// returns the absolute path. The file is created with perm bits.
+func WriteFile(path string, data []byte, perm os.FileMode) (string, error) {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+	}
+	if err := os.WriteFile(path, data, perm); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// Which returns true if cmd resolves via exec.LookPath (command -v).
+func Which(cmd string) bool {
+	_, err := exec.LookPath(cmd)
+	return err == nil
 }
 
 // ResolveUID resolves a user name (or numeric UID) to a UID.

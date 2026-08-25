@@ -5,6 +5,12 @@ package domain
 type ProcessNode struct {
 	// Name is a unique identifier for the process (e.g., "postgresql").
 	Name string
+	// Optional, when true, marks this child as non-fatal: if it fails (exits
+	// non-zero without restart, or errors), the error is logged but does NOT
+	// cancel the parent tree or exit the container. Use for sidecars (pgbouncer,
+	// pgbackrest, sshd, backups) whose failure should not take down the main
+	// program. Default false (fatal — preserves current behavior).
+	Optional bool
 	// Process holds the configuration for the executable.
 	Process Process
 	// Files is a slice of FileProvision rules applied before this process starts
@@ -16,6 +22,13 @@ type ProcessNode struct {
 	// NeedParentReady is true, children wait until this probe passes (or Start
 	// returns if no probe is set).
 	Readiness *Probe
+	// ReadinessFunc, when set, is a Go callback that reports whether the node is
+	// ready. It overrides the declarative Readiness probe. Go-only (not
+	// serializable); the script delivery layer binds it from a JS function via the
+	// runtime invoker (the goja:"readiness" tag maps it from the script's
+	// `readiness: () => ...` property). It must be short and non-blocking. Called
+	// repeatedly until it returns true or the node's context is cancelled.
+	ReadinessFunc func() bool `goja:"readiness"`
 	// Restart controls whether and how this process is restarted on failure
 	// (optional; nil means never restart).
 	Restart *RestartPolicy
@@ -43,6 +56,16 @@ type ProcessNode struct {
 	// for the duration of this node's supervision, gated on Health.ReadyProbe.
 	// Mutually exclusive with Exec.
 	Health *HealthConfig
+	// OnStart is an optional callback invoked after the process has started.
+	// Go-only (not serializable); the script delivery layer binds it from a JS
+	// function. It must be short and non-blocking.
+	OnStart func()
+	// OnReady is an optional callback invoked after the node's readiness probe
+	// passes. Go-only; see OnStart for the binding and concurrency notes.
+	OnReady func()
+	// OnExit is an optional callback invoked with the exit code after the
+	// process exits. Go-only; see OnStart for the binding and concurrency notes.
+	OnExit func(code int)
 	// Children is a slice of dependent child processes (recursive for unlimited depth).
 	Children []ProcessNode
 }

@@ -51,6 +51,7 @@ type EzxModule struct {
 	API       *ApiModule       `goja:"api"`
 	YAML      *YamlModule      `goja:"yaml"`
 	Config    *ConfigModule    `goja:"config"`
+	Shell     *ShellModule     `goja:"shell"`
 }
 
 // NewEzxModule builds the aggregate ezx module from the given dependencies.
@@ -58,15 +59,16 @@ func NewEzxModule(d Deps) *EzxModule {
 	return &EzxModule{
 		Env:       NewEnvModule(),
 		Editor:    NewEditorModule(),
-		Process:   NewProcessModule(d.Ctx, d.Proc),
+		Process:   NewProcessModule(d.Ctx, d.Proc, d.Callbacks),
 		Log:       NewLogModule(d.Log),
 		Chain:     NewChainModule(d.Ctx, d.Chain),
 		FS:        NewFSModule(),
 		Health:    NewHealthModule(d.Ready),
 		Probe:     NewProbeModule(d.Ctx),
-		Scheduler: NewSchedulerModule(d.Sched),
+		Scheduler: NewSchedulerModule(d.Sched, d.Callbacks),
 		API:       NewApiModule(d.Routes, d.Callbacks),
 		YAML:      NewYamlModule(),
 		Config:    NewConfigModule(),
+		Shell:     NewShellModule(),
 	}
 }
