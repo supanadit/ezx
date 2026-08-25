@@ -522,8 +522,8 @@ func scriptTestFileExists(path string) bool {
 	return err == nil
 }
 
-// TestScriptReadinessFunc verifies that a JS `readiness: () => ...` property on
-// a node binds to the Go ReadinessFunc callback and gates a needParentReady
+// TestScriptReadinessFunc verifies that a JS `readinessFunc: () => ...` property
+// on a node binds to the Go ReadinessFunc callback and gates a needParentReady
 // child: the child starts only after the callback returns true.
 func TestScriptReadinessFunc(t *testing.T) {
 	startC := make(chan string, 8)
@@ -550,7 +550,7 @@ func TestScriptReadinessFunc(t *testing.T) {
 			name: "pg",
 			process: { binaryPath: "/bin/true" },
 			restart: { mode: "never" },
-			readiness: () => { calls++; return calls >= 2; },
+			readinessFunc: () => { calls++; return calls >= 2; },
 			children: [{ name: "sidecar", needParentReady: true, process: { binaryPath: "/bin/true" } }],
 		}] });
 	`

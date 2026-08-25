@@ -25,10 +25,10 @@ type ProcessNode struct {
 	// ReadinessFunc, when set, is a Go callback that reports whether the node is
 	// ready. It overrides the declarative Readiness probe. Go-only (not
 	// serializable); the script delivery layer binds it from a JS function via the
-	// runtime invoker (the goja:"readiness" tag maps it from the script's
-	// `readiness: () => ...` property). It must be short and non-blocking. Called
-	// repeatedly until it returns true or the node's context is cancelled.
-	ReadinessFunc func() bool `goja:"readiness"`
+	// runtime invoker (the goja:"readinessFunc" tag maps it from the script's
+	// `readinessFunc: () => ...` property). It must be short and non-blocking.
+	// Called repeatedly until it returns true or the node's context is cancelled.
+	ReadinessFunc func() bool `goja:"readinessFunc"`
 	// Restart controls whether and how this process is restarted on failure
 	// (optional; nil means never restart).
 	Restart *RestartPolicy
