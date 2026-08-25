@@ -363,7 +363,7 @@ func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc p
 	if shutdown.Signal == nil {
 		shutdown.Signal = syscall.SIGTERM
 	}
-	if shutdown.Timeout <= 0 {
+	if shutdown.Timeout == 0 {
 		shutdown.Timeout = 30 * time.Second
 	}
 
@@ -595,7 +595,7 @@ func (s *Service) resolveShutdown(node domain.ProcessNode) domain.ShutdownConfig
 	if shutdown.Signal == nil {
 		shutdown.Signal = syscall.SIGTERM
 	}
-	if shutdown.Timeout <= 0 {
+	if shutdown.Timeout == 0 {
 		shutdown.Timeout = 30 * time.Second
 	}
 	return *shutdown
@@ -693,6 +693,10 @@ func (s *Service) triggerFor(name string) *domain.Trigger {
 func (s *Service) drain(ctx context.Context, proc process.ProcessRepository, cfg domain.ShutdownConfig) error {
 	if err := proc.Signal(cfg.Signal); err != nil {
 		s.log.Warn("signal failed: %v", err)
+	}
+	if cfg.Timeout < 0 {
+		<-proc.Done()
+		return nil
 	}
 	timer := time.NewTimer(cfg.Timeout)
 	defer timer.Stop()

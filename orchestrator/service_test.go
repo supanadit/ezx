@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ type fakeProc struct {
 	delay    time.Duration
 	startC   chan string
 	done     chan struct{}
+	killed   bool
 }
 
 func newFakeProc(name string, exitCode int, startC chan string) *fakeProc {
@@ -55,7 +57,12 @@ func (f *fakeProc) Start(_ context.Context, _ []string, _ domain.LogConfig) erro
 
 func (f *fakeProc) Wait() (int, error)     { <-f.done; return f.exitCode, nil }
 func (f *fakeProc) Signal(os.Signal) error { return nil }
-func (f *fakeProc) Kill() error            { return nil }
+func (f *fakeProc) Kill() error {
+	f.mu.Lock()
+	f.killed = true
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeProc) PID() int               { return 1 }
 func (f *fakeProc) Done() <-chan struct{}  { return f.done }
 func (f *fakeProc) Output() (string, string) {
@@ -743,5 +750,55 @@ func TestRunReadinessFuncNeverReadySpawnsChildren(t *testing.T) {
 	}
 	if len(order) != 2 || order[0] != "parent" || order[1] != "child" {
 		t.Fatalf("start order = %v, want [parent child]", order)
+	}
+}
+
+// TestDrainNegativeTimeoutUnbounded verifies that a ShutdownConfig with a
+// negative Timeout waits indefinitely for the process to exit and never
+// force-kills it, even when ForceKill is true.
+func TestDrainNegativeTimeoutUnbounded(t *testing.T) {
+	// A process that never exits: its Done channel stays open for the duration
+	// of the test (simulating postgres ignoring SIGTERM while it flushes WAL).
+	proc := newFakeProc("postgres", 0, nil)
+	proc.delay = 10 * time.Minute // effectively "keeps running"
+	svc := newTestService(map[string]*fakeProc{"postgres": proc})
+
+	cfg := domain.ShutdownConfig{
+		Signal:    syscall.SIGTERM,
+		Timeout:   -1,
+		ForceKill: true,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	drained := make(chan error, 1)
+	go func() { drained <- svc.drain(ctx, proc, cfg) }()
+
+	// A negative Timeout must skip the force-kill timer: within a short window
+	// the process must NOT be killed.
+	select {
+	case err := <-drained:
+		t.Fatalf("drain returned early (%v); negative timeout must wait indefinitely", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	proc.mu.Lock()
+	killed := proc.killed
+	proc.mu.Unlock()
+	if killed {
+		t.Fatal("process was force-killed despite negative (unbounded) timeout")
+	}
+
+	// End the wait by letting the process exit; drain must return nil.
+	proc.mu.Lock()
+	close(proc.done)
+	proc.mu.Unlock()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("drain returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not return after process exited")
 	}
 }

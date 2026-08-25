@@ -115,7 +115,9 @@ type ShutdownConfig struct {
 	// Signal is sent to the process to request a graceful stop. Defaults to
 	// SIGTERM.
 	Signal os.Signal
-	// Timeout is how long to wait for a graceful exit before escalating.
+	// Timeout is how long to wait for the process to exit after Signal before
+	// force-killing (when ForceKill is true). A negative value means wait
+	// indefinitely (no force-kill). Zero means the default (30s).
 	Timeout time.Duration
 	// ForceKill, when true, sends SIGKILL after Timeout elapses.
 	ForceKill bool
