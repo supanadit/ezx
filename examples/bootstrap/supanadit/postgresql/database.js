@@ -93,7 +93,7 @@ function markRestorePending() {
 function configureReplicaAppname() {
 	const autoConf = PGDATA + "/postgresql.auto.conf";
 	if (!fs.exists(autoConf)) return;
-	const appname = env.get("REPLICATION_APPNAME", require("os").hostname());
+	const appname = env.get("REPLICATION_APPNAME", env.get("HOSTNAME", ""));
 	editor
 		.open(autoConf)
 		.upsert(
@@ -126,7 +126,7 @@ function clonePrimary() {
 			process: {
 				binaryPath: argv[0],
 				arguments: argv.slice(1),
-				env: ["PGPASSWORD=" + REPL_PASSWORD],
+				environment: ["PGPASSWORD=" + REPL_PASSWORD],
 				user: PG_USER,
 				group: PG_GROUP,
 			},

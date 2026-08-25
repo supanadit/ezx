@@ -56,7 +56,7 @@ function isPrimaryRole() {
 				"-c",
 				"select pg_is_in_recovery();",
 			],
-			env: ["PGPASSWORD=" + (env.get("POSTGRES_PASSWORD") || "")],
+			environment: ["PGPASSWORD=" + (env.get("POSTGRES_PASSWORD") || "")],
 			check: false,
 		},
 	});
