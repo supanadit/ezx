@@ -561,7 +561,7 @@ func (s *Service) runScheduled(ctx context.Context, node domain.ProcessNode) err
 			s.log.Info("[%s] context cancelled, draining scheduler", node.Name)
 			return nil
 		case <-timer:
-			if now.Before(next) {
+			if time.Now().Before(next) {
 				// timer fired slightly early (clock); recompute on next pass.
 				continue
 			}

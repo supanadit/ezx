@@ -290,6 +290,55 @@ func TestScheduledNodeCallbackTick(t *testing.T) {
 	<-runDone
 }
 
+func TestScheduledNodeAutonomousCronTickFires(t *testing.T) {
+	procs := map[string]*fakeProc{}
+	svc := newTestService(procs)
+
+	var mu sync.Mutex
+	ticks := 0
+	chain := domain.ProcessChain{
+		Roots: []domain.ProcessNode{
+			{
+				Name:    "job",
+				Process: domain.Process{BinaryPath: "/bin/true"},
+				Scheduler: &domain.SchedulerConfig{
+					Schedule:    domain.CronSchedule{Expression: "* * * * *"},
+					MinInterval: time.Nanosecond,
+					Tick: func() {
+						mu.Lock()
+						ticks++
+						mu.Unlock()
+					},
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- svc.Run(ctx, chain) }()
+	waitScheduled(t, svc, "job")
+
+	// An autonomous (non-trigger) cron tick fires on the next minute boundary
+	// (within <=60s); wait up to ~65s for it.
+	deadline := time.Now().Add(65 * time.Second)
+	for {
+		mu.Lock()
+		n := ticks
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("autonomous cron tick never fired")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	cancel()
+	<-runDone
+}
+
 func TestRunStartsNeedReadyChildAfterParent(t *testing.T) {
 	startC := make(chan string, 10)
 	parent := newFakeProc("parent", 0, startC)
