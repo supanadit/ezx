@@ -5,19 +5,28 @@ package repository
 import (
 	"context"
 	"os"
+	"os/exec"
 	"testing"
 
 	"github.com/supanadit/ezx/domain"
 )
 
 func TestProcessRunningAndZombies(t *testing.T) {
-	// The test binary itself is a running process.
-	if !ProcessRunning("probe_linux.test") {
-		// comm may be truncated to 15 chars; accept a substring match on "probe".
-		if !ProcessRunning("probe") {
-			t.Fatalf("ProcessRunning should detect the running test process")
-		}
+	// Spawn a known long-running process and assert ProcessRunning detects it
+	// by its comm. Deterministic — does not depend on the test binary's name.
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
 	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	if !ProcessRunning("sleep") {
+		t.Fatalf("ProcessRunning should detect the spawned sleep process")
+	}
+
 	// /proc must be mounted on Linux.
 	if os.Getpid() <= 0 {
 		t.Fatal("bad pid")
