@@ -3,7 +3,9 @@ package system
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/supanadit/ezx/domain"
@@ -203,5 +205,132 @@ func TestStartReaperExitCodeZero(t *testing.T) {
 func TestStartReaperExitCodeNonZero(t *testing.T) {
 	if code := newReaperProc(t, "exit 3"); code != 3 {
 		t.Fatalf("reaper exit code = %d, want 3", code)
+	}
+}
+
+// startFileProc spawns /bin/sh -c "$cmd" with both streams routed to a rotating
+// file at path (maxBytes/maxBackups configurable) and returns the repository.
+func startFileProc(t *testing.T, path string, maxBytes int64, maxBackups int, cmd string) *ProcessRepository {
+	t.Helper()
+	repo := NewProcessRepository(domain.ProcessNode{
+		Name: "sh",
+		Process: domain.Process{
+			BinaryPath: "/bin/sh",
+			Arguments:  []string{"-c", cmd},
+		},
+	}, nil)
+	if err := repo.Start(context.Background(), []string{}, domain.LogConfig{
+		Stdout:     domain.LogDestFile,
+		Stderr:     domain.LogDestFile,
+		FilePath:   path,
+		MaxBytes:   maxBytes,
+		MaxBackups: maxBackups,
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return repo
+}
+
+// TestStartFileLogStdout verifies a node with LogDestFile writes stdout to the
+// file.
+func TestStartFileLogStdout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.log")
+	repo := startFileProc(t, path, 1<<20, 3, `echo "hello stdout"`)
+	if _, err := repo.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(got), "hello stdout") {
+		t.Fatalf("file = %q, want it to contain %q", got, "hello stdout")
+	}
+}
+
+// TestStartFileLogStderr verifies a node with LogDestFile writes stderr to the
+// file.
+func TestStartFileLogStderr(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "err.log")
+	repo := startFileProc(t, path, 1<<20, 3, `echo "hello stderr" >&2`)
+	if _, err := repo.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(got), "hello stderr") {
+		t.Fatalf("file = %q, want it to contain %q", got, "hello stderr")
+	}
+}
+
+// TestStartFileLogBothStreamsSharedPath verifies stdout+stderr routing to the
+// same path share one writer and produce one interleaved file.
+func TestStartFileLogBothStreamsSharedPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "both.log")
+	repo := startFileProc(t, path, 1<<20, 3, `echo "to-out"; echo "to-err" >&2`)
+	if _, err := repo.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(got), "to-out") || !strings.Contains(string(got), "to-err") {
+		t.Fatalf("file = %q, want it to contain both %q and %q", got, "to-out", "to-err")
+	}
+}
+
+// TestStartFileLogRotates verifies a file-backed process rotates on disk when
+// output exceeds maxBytes (tiny value).
+func TestStartFileLogRotates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rot.log")
+	// Emit 5 lines of 20 bytes each = 100 bytes; maxBytes=50 forces rotation.
+	repo := startFileProc(t, path, 50, 3, `for i in 1 2 3 4 5; do echo "01234567890123456789"; done`)
+	if _, err := repo.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	// At least one backup must exist.
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("expected a rotated backup %q, stat err = %v", path+".1", err)
+	}
+}
+
+// TestStartFileLogWritersClosedOnExit verifies file writers are closed after the
+// process exits (no fd leak): the repository's writer table is drained.
+func TestStartFileLogWritersClosedOnExit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "closed.log")
+	repo := startFileProc(t, path, 1<<20, 3, `echo "hi"`)
+	if _, err := repo.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	repo.fileMu.Lock()
+	n := len(repo.fileWriters)
+	repo.fileMu.Unlock()
+	if n != 0 {
+		t.Fatalf("fileWriters not drained after exit: %d writers remain", n)
+	}
+}
+
+// TestStartFileLogRequiresFilePath verifies a file destination without a path is
+// rejected defensively at spawn time.
+func TestStartFileLogRequiresFilePath(t *testing.T) {
+	repo := NewProcessRepository(domain.ProcessNode{
+		Name: "sh",
+		Process: domain.Process{
+			BinaryPath: "/bin/sh",
+			Arguments:  []string{"-c", "true"},
+		},
+	}, nil)
+	err := repo.Start(context.Background(), []string{}, domain.LogConfig{
+		Stdout: domain.LogDestFile,
+	})
+	if err == nil {
+		t.Fatal("Start with file dest and empty filePath should error, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires filePath") {
+		t.Fatalf("Start error = %q, want it to mention requires filePath", err)
 	}
 }

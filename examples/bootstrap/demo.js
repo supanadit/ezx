@@ -30,7 +30,7 @@ chain.run({
 				binaryPath: "/bin/sh",
 				arguments: [
 					"-c",
-					"echo 'GREETING='$GREETING && echo 'PHP_MEMORY_LIMIT=${PHP_MEMORY_LIMIT:-FILTERED}' && cat /tmp/ezx-php.ini && cat /tmp/ezx-postgresql.conf",
+					"echo 'GREETING='$GREETING && echo 'PHP_MEMORY_LIMIT=${PHP_MEMORY_LIMIT:-FILTERED}' && cat /tmp/ezx-php.ini 2>/dev/null; cat /tmp/ezx-postgresql.conf 2>/dev/null; true",
 				],
 				environment: ["GREETING=Hello from EZX script"],
 				filterEnv: ["PHP_MEMORY_LIMIT"],

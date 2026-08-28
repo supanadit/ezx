@@ -5,6 +5,7 @@ package system
 import (
 	"context"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,8 +18,11 @@ func TestReaperReapsOrphanedGrandchild(t *testing.T) {
 	}
 
 	var reaped []string
+	var mu sync.Mutex
 	reaper := NewReaper(func(format string, args ...any) {
+		mu.Lock()
 		reaped = append(reaped, format)
+		mu.Unlock()
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -49,7 +53,10 @@ func TestReaperReapsOrphanedGrandchild(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
-		if len(reaped) > 0 {
+		mu.Lock()
+		n := len(reaped)
+		mu.Unlock()
+		if n > 0 {
 			return // orphan was reaped and logged
 		}
 	}

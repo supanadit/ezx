@@ -97,6 +97,9 @@ const (
 	// LogDestCapture buffers process output for later retrieval via
 	// ProcessRepository.Output. Used by one-shot capture (process.capture).
 	LogDestCapture LogDest = "capture"
+	// LogDestFile writes process output to LogConfig.FilePath with
+	// size-based rotation (MaxBytes/MaxBackups).
+	LogDestFile LogDest = "file"
 )
 
 // LogConfig controls how a spawned process's output is routed.
@@ -105,9 +108,15 @@ type LogConfig struct {
 	Stdout LogDest
 	// Stderr is the destination for the process's standard error.
 	Stderr LogDest
-	// FilePath, when Stdout or Stderr is a file-backed destination, is the
-	// target file path. Reserved for future per-process log files.
+	// FilePath is the target file path when Stdout or Stderr is LogDestFile.
+	// Required for file destinations; parent directories are created on open.
 	FilePath string
+	// MaxBytes is the max size in bytes of the active log file before rotation
+	// (0 = default 10 MiB). Applies to file destinations only.
+	MaxBytes int64
+	// MaxBackups is how many rotated files (path.1 … path.N) to keep;
+	// <0 = unlimited, 0 = default 3. Applies to file destinations only.
+	MaxBackups int
 }
 
 // ShutdownConfig controls graceful shutdown of a ProcessNode.

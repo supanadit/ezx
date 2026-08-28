@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -849,5 +850,295 @@ func TestDrainNegativeTimeoutUnbounded(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("drain did not return after process exited")
+	}
+}
+
+// drainStarts reads every name from startC until it has been quiet for the
+// given idle window, returning the recorded start order.
+func drainStarts(t *testing.T, startC chan string, idle time.Duration) []string {
+	t.Helper()
+	var order []string
+	deadline := time.Now().Add(idle)
+	for {
+		select {
+		case n := <-startC:
+			order = append(order, n)
+			deadline = time.Now().Add(idle)
+		default:
+			if time.Now().After(deadline) {
+				return order
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+}
+
+// TestLoneOneshotRunsToCompletion verifies a lone oneshot node (which would
+// otherwise hit the exec-default path) runs to completion instead of exec'ing:
+// its process is started and the chain completes.
+func TestLoneOneshotRunsToCompletion(t *testing.T) {
+	startC := make(chan string, 10)
+	init := newFakeProc("init", 0, startC)
+	procs := map[string]*fakeProc{"init": init}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
+		{Name: "init", Oneshot: true},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	select {
+	case n := <-startC:
+		if n != "init" {
+			t.Fatalf("started %q, want init", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lone oneshot never started")
+	}
+}
+
+// TestOneshotExitZeroStartsDependents verifies D2: a oneshot that exits 0
+// signals started+ready, so its dependents start only after it completes.
+func TestOneshotExitZeroStartsDependents(t *testing.T) {
+	startC := make(chan string, 10)
+	init := newFakeProc("init", 0, startC)
+	app := newFakeProc("app", 0, startC)
+	init.delay = 50 * time.Millisecond
+	app.delay = 200 * time.Millisecond
+	procs := map[string]*fakeProc{"init": init, "app": app}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
+		{Name: "init", Oneshot: true},
+		{Name: "app", DependsOn: []string{"init"}},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	order := drainStarts(t, startC, 100*time.Millisecond)
+	if len(order) != 2 || order[0] != "init" || order[1] != "app" {
+		t.Fatalf("start order = %v, want [init app]", order)
+	}
+}
+
+// TestOneshotNonZeroFailsChain verifies a fatal (non-Optional) oneshot that
+// exits non-zero fails the chain and skips its dependents.
+func TestOneshotNonZeroFailsChain(t *testing.T) {
+	startC := make(chan string, 10)
+	init := newFakeProc("init", 3, startC)
+	app := newFakeProc("app", 0, startC)
+	init.delay = 50 * time.Millisecond
+	procs := map[string]*fakeProc{"init": init, "app": app}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
+		{Name: "init", Oneshot: true},
+		{Name: "app", DependsOn: []string{"init"}},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := svc.Run(ctx, chain)
+	var ee *domain.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("Run error = %v, want *domain.ExitError", err)
+	}
+	if ee.Code != 3 {
+		t.Fatalf("ExitError.Code = %d, want 3", ee.Code)
+	}
+	// Only init starts; app is skipped.
+	order := drainStarts(t, startC, 100*time.Millisecond)
+	if len(order) != 1 || order[0] != "init" {
+		t.Fatalf("start order = %v, want [init] (app skipped)", order)
+	}
+}
+
+// TestOneshotNonZeroOptionalContinues verifies an Optional oneshot that exits
+// non-zero does NOT fail the chain; its dependents are skipped and Run returns
+// nil.
+func TestOneshotNonZeroOptionalContinues(t *testing.T) {
+	startC := make(chan string, 10)
+	init := newFakeProc("init", 3, startC)
+	app := newFakeProc("app", 0, startC)
+	init.delay = 50 * time.Millisecond
+	procs := map[string]*fakeProc{"init": init, "app": app}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
+		{Name: "init", Oneshot: true, Optional: true},
+		{Name: "app", DependsOn: []string{"init"}},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run returned error for optional oneshot failure: %v", err)
+	}
+	order := drainStarts(t, startC, 100*time.Millisecond)
+	if len(order) != 1 || order[0] != "init" {
+		t.Fatalf("start order = %v, want [init] (app skipped)", order)
+	}
+}
+
+// TestOneshotRestartRetriesThenSucceeds verifies D4: a oneshot with
+// Restart.MaxRetries retries on failure and, on a successful retry, unblocks
+// its dependents.
+func TestOneshotRestartRetriesThenSucceeds(t *testing.T) {
+	startC := make(chan string, 10)
+	var mu sync.Mutex
+	attempts := 0
+	svc := NewService(
+		func(node domain.ProcessNode) process.ProcessRepository {
+			mu.Lock()
+			attempts++
+			code := 0
+			if attempts == 1 {
+				code = 1 // first attempt fails
+			}
+			mu.Unlock()
+			return newFakeProc(node.Name, code, startC)
+		},
+		&fakeLogger{},
+		nil,
+	)
+
+	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
+		{Name: "init", Oneshot: true, Restart: &domain.RestartPolicy{Mode: domain.RestartOnFailure, MaxRetries: 2, Backoff: time.Millisecond}},
+		{Name: "app", DependsOn: []string{"init"}},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The oneshot is retried (init appears twice) and app starts after the
+	// successful retry.
+	order := drainStarts(t, startC, 100*time.Millisecond)
+	initCount := 0
+	appSeen := false
+	for _, n := range order {
+		if n == "init" {
+			initCount++
+		}
+		if n == "app" {
+			appSeen = true
+		}
+	}
+	if initCount < 2 {
+		t.Fatalf("oneshot started %d times, want >=2 (initial + retry); order=%v", initCount, order)
+	}
+	if !appSeen {
+		t.Fatalf("app never started after oneshot retry succeeded; order=%v", order)
+	}
+	// app must come after the last init attempt.
+	lastInit := -1
+	appIdx := -1
+	for i, n := range order {
+		if n == "init" {
+			lastInit = i
+		}
+		if n == "app" {
+			appIdx = i
+		}
+	}
+	if appIdx < lastInit {
+		t.Fatalf("app started before the oneshot's final successful attempt; order=%v", order)
+	}
+}
+
+// TestOneshotCtxCancelDrains verifies a oneshot mid-run drains on context
+// cancellation (force-killed by its short shutdown config).
+func TestOneshotCtxCancelDrains(t *testing.T) {
+	startC := make(chan string, 10)
+	init := newFakeProc("init", 0, startC)
+	init.delay = 10 * time.Minute // never exits on its own
+	procs := map[string]*fakeProc{"init": init}
+	svc := newTestService(procs)
+
+	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
+		{Name: "init", Oneshot: true, Shutdown: &domain.ShutdownConfig{Signal: syscall.SIGTERM, Timeout: 5 * time.Millisecond, ForceKill: true}},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- svc.Run(ctx, chain) }()
+
+	select {
+	case n := <-startC:
+		if n != "init" {
+			t.Fatalf("started %q, want init", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for oneshot to start")
+	}
+
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned error after cancel: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	init.mu.Lock()
+	killed := init.killed
+	init.mu.Unlock()
+	if !killed {
+		t.Fatal("oneshot was not force-killed on drain")
+	}
+}
+
+// TestOneshotInitDAGExecFiresAfterOneshots verifies D6/D7: an exec node with
+// oneshot deps fires only after all its oneshot deps exit 0. A simulated
+// still-supervised long-running sibling makes the exec node error (hasActiveSiblings
+// guard) instead of actually exec'ing the test process; the oneshots must have
+// completed (done channels closed) before that error.
+func TestOneshotInitDAGExecFiresAfterOneshots(t *testing.T) {
+	startC := make(chan string, 10)
+	initdb := newFakeProc("initdb", 0, startC)
+	stanza := newFakeProc("stanza-create", 0, startC)
+	initdb.delay = 50 * time.Millisecond
+	stanza.delay = 50 * time.Millisecond
+	procs := map[string]*fakeProc{"initdb": initdb, "stanza-create": stanza}
+	svc := newTestService(procs)
+
+	// Simulate a still-supervised long-running sibling so the exec node errors
+	// (hasActiveSiblings guard) instead of replacing the test process.
+	svc.beginActive()
+
+	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
+		{Name: "initdb", Oneshot: true},
+		{Name: "stanza-create", Oneshot: true, DependsOn: []string{"initdb"}},
+		{Name: "postgres", Exec: true, DependsOn: []string{"initdb", "stanza-create"}},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := svc.Run(ctx, chain)
+	if err == nil || !strings.Contains(err.Error(), "active siblings") {
+		t.Fatalf("Run error = %v, want exec active-siblings error", err)
+	}
+
+	// Both oneshots must have exited 0 (done closed) before the exec node fired.
+	select {
+	case <-initdb.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initdb oneshot never completed before exec fired")
+	}
+	select {
+	case <-stanza.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stanza-create oneshot never completed before exec fired")
 	}
 }

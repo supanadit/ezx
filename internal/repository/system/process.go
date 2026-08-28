@@ -3,8 +3,11 @@ package system
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"sync"
 
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/internal/repository"
@@ -33,6 +36,12 @@ type ProcessRepository struct {
 	// LogDestCapture for the corresponding stream.
 	stdoutBuf bytes.Buffer
 	stderrBuf bytes.Buffer
+
+	// fileWriters holds the shared rotating file writers opened for this
+	// process, keyed by path. stdout+stderr routing to the same path share one
+	// writer so interleaving stays coherent and rotation happens once (D7).
+	fileWriters map[string]io.WriteCloser
+	fileMu      sync.Mutex
 }
 
 // NewProcessRepository creates a handle for the given ProcessNode, reaping its
@@ -78,6 +87,12 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	}
 	repository.SetProcessGroupLeader(cmd)
 
+	// A file-backed destination requires a target path (defensive check; the
+	// chain validator already fails fast on this).
+	if (lc.Stdout == domain.LogDestFile || lc.Stderr == domain.LogDestFile) && lc.FilePath == "" {
+		return fmt.Errorf("log destination %q requires filePath", domain.LogDestFile)
+	}
+
 	switch lc.Stdout {
 	case domain.LogDestDiscard:
 		cmd.Stdout = nil
@@ -85,6 +100,13 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 		cmd.Stdout = &cappedWriter{buf: &s.stdoutBuf}
 	case domain.LogDestStderr:
 		cmd.Stdout = os.Stderr
+	case domain.LogDestFile:
+		w, err := s.resolveFileWriter(lc.FilePath, lc.MaxBytes, lc.MaxBackups)
+		if err != nil {
+			s.closeFileWriters()
+			return err
+		}
+		cmd.Stdout = w
 	default: // LogDestStdout
 		cmd.Stdout = os.Stdout
 	}
@@ -93,18 +115,29 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 		cmd.Stderr = nil
 	case domain.LogDestCapture:
 		cmd.Stderr = &cappedWriter{buf: &s.stderrBuf}
+	case domain.LogDestFile:
+		w, err := s.resolveFileWriter(lc.FilePath, lc.MaxBytes, lc.MaxBackups)
+		if err != nil {
+			s.closeFileWriters()
+			return err
+		}
+		cmd.Stderr = w
 	default: // LogDestStderr
 		cmd.Stderr = os.Stderr
 	}
 
 	if err := cmd.Start(); err != nil {
+		s.closeFileWriters()
 		close(s.done)
 		return err
 	}
 	s.cmd = cmd
 
 	// Reap through the shared reaper when available (avoids racing wait4);
-	// otherwise fall back to a local cmd.Wait goroutine.
+	// otherwise fall back to a local cmd.Wait goroutine. File writers are closed
+	// right before done fires so Wait() returning guarantees they are drained
+	// (no fd leak). The pipe-backed writer means the child never holds the file
+	// fd, so rotation (close/rename/reopen) is safe while the child runs.
 	if s.reaper != nil {
 		ch := s.reaper.Register(cmd.Process.Pid)
 		go func() {
@@ -112,11 +145,13 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 			if ok {
 				s.code = exit.code
 			}
+			s.closeFileWriters()
 			close(s.done)
 		}()
 	} else {
 		go func() {
 			_ = cmd.Wait()
+			s.closeFileWriters()
 			close(s.done)
 		}()
 	}
@@ -173,6 +208,36 @@ func (s *ProcessRepository) Done() <-chan struct{} {
 // LogDestCapture. Empty strings when capture was not requested.
 func (s *ProcessRepository) Output() (stdout, stderr string) {
 	return s.stdoutBuf.String(), s.stderrBuf.String()
+}
+
+// resolveFileWriter returns the shared rotating writer for path, creating it on
+// first use. stdout+stderr routing to the same path share one writer (D7).
+func (s *ProcessRepository) resolveFileWriter(path string, maxBytes int64, maxBackups int) (io.WriteCloser, error) {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	if s.fileWriters == nil {
+		s.fileWriters = make(map[string]io.WriteCloser)
+	}
+	if w, ok := s.fileWriters[path]; ok {
+		return w, nil
+	}
+	w, err := newRotatingFileWriter(path, maxBytes, maxBackups)
+	if err != nil {
+		return nil, err
+	}
+	s.fileWriters[path] = w
+	return w, nil
+}
+
+// closeFileWriters closes every file writer opened for this process. Called on
+// process exit (done fires) and on Start() error paths to avoid fd leaks.
+func (s *ProcessRepository) closeFileWriters() {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	for path, w := range s.fileWriters {
+		_ = w.Close()
+		delete(s.fileWriters, path)
+	}
 }
 
 // cappedWriter writes into a bytes.Buffer up to maxCaptureBytes, then truncates

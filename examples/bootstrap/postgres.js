@@ -1,6 +1,6 @@
 // ezx bootstrap examples/bootstrap/postgres.js
 //
-// A faithful port of the official PostgreSQL docker-entrypoint.sh, driven
+// A port of the official PostgreSQL docker-entrypoint.sh, driven
 // entirely through the ezx JS host API. It covers:
 //   1. docker_setup_env  → env.get with defaults
 //   2. first-run detection → fs.exists("$PGDATA/PG_VERSION")

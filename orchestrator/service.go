@@ -1,5 +1,5 @@
 // Package orchestrator implements the supervisor use-case: it walks a
-// ProcessChain tree and drives each node through its lifecycle (provision →
+// ProcessChain graph and drives each node through its lifecycle (provision →
 // probe-gated start → supervise → graceful drain) by composing the process and
 // logger Ports with the internal/repository helpers. It contains no OS
 // specifics and imports no adapter types.
@@ -51,22 +51,325 @@ func NewService(
 	}
 }
 
-// Run executes every root in the chain and supervises the full dependency tree.
+// Run executes a ProcessChain. It normalizes and validates the chain, then
+// drives the resulting flat DAG through a coordinator: every node whose
+// dependencies are satisfied starts concurrently, and an event router applies
+// the edge semantics (§5 of the DAG design) as nodes transition through their
+// lifecycle. Multi-root (no-dependency) nodes start together; a lone chain
+// keeps the exec default. The first fatal (non-Optional) node failure cancels
+// the whole chain and is returned as the Run error.
 func (s *Service) Run(ctx context.Context, chain domain.ProcessChain) error {
-	// A lone leaf root with no restart policy, no health config, and no
-	// scheduler defaults to exec: the real service replaces ezx and becomes
-	// PID 1 (the common single-process container case). Multi-root, non-leaf,
-	// restart, health, or scheduled nodes stay supervised.
-	execDefault := len(chain.Roots) == 1 &&
-		len(chain.Roots[0].Children) == 0 &&
-		chain.Roots[0].Restart == nil &&
-		chain.Roots[0].Scheduler == nil
-	for _, root := range chain.Roots {
-		if err := s.runNode(ctx, root, execDefault); err != nil {
-			return err
+	norm, err := chain.Normalized()
+	if err != nil {
+		return err
+	}
+	if err := domain.ValidateChain(norm); err != nil {
+		return err
+	}
+	return s.runDAG(ctx, norm)
+}
+
+// nodeState tracks a node's progress through the DAG. pending nodes wait on
+// their deps; running nodes are in their lifecycle; exited/skipped are
+// terminal (permanently left the graph).
+type nodeState int
+
+const (
+	statePending nodeState = iota
+	stateRunning
+	stateExited
+	stateSkipped
+)
+
+// nodeEntry is the per-node bookkeeping used by the coordinator's event router.
+// Transitions are signaled by closing the corresponding channel exactly once,
+// under coordinator.mu.
+type nodeEntry struct {
+	node       domain.ProcessNode
+	deps       []*nodeEntry
+	dependents []*nodeEntry
+	edges      []domain.Edge // canonical per-edge wait modes
+	pending    int           // deps not yet satisfied (started/ready/exited), pre-start
+
+	goCh    chan struct{} // closed when the node may start
+	started chan struct{} // closed when the process (or scheduler) has started
+	ready   chan struct{} // closed when the readiness phase is done
+	exited  chan struct{} // closed when the node permanently exits (or is skipped)
+
+	state       nodeState
+	goClosed    bool
+	startedC    bool
+	readyC      bool
+	exitedC     bool
+	drainCancel context.CancelFunc
+	optional    bool
+}
+
+// coordinator owns the flat DAG run: it routes dep transitions to dependents
+// and propagates the chain context and first fatal error.
+type coordinator struct {
+	s           *Service
+	chainCtx    context.Context
+	cancel      context.CancelFunc
+	execDefault bool
+
+	mu      sync.Mutex
+	entries []*nodeEntry
+	byName  map[string]*nodeEntry
+	errOnce sync.Once
+	errCh   chan error
+}
+
+// runDAG drives a normalized, validated flat chain. Every node runs in its own
+// goroutine; a node whose deps are all satisfied starts immediately, and the
+// event router handles started/ready/permanent-exit/failure routing. It blocks
+// until every node has exited, skipped, or been drained, then returns the first
+// fatal error (if any).
+func (s *Service) runDAG(ctx context.Context, chain domain.ProcessChain) error {
+	if len(chain.Nodes) == 0 {
+		return nil
+	}
+	co := &coordinator{
+		s:      s,
+		errCh:  make(chan error, 1),
+		byName: make(map[string]*nodeEntry, len(chain.Nodes)),
+	}
+	co.chainCtx, co.cancel = context.WithCancel(ctx)
+	defer co.cancel()
+
+	for i := range chain.Nodes {
+		n := &chain.Nodes[i]
+		e := &nodeEntry{
+			node:     *n,
+			goCh:     make(chan struct{}),
+			started:  make(chan struct{}),
+			ready:    make(chan struct{}),
+			exited:   make(chan struct{}),
+			optional: n.Optional,
+		}
+		co.byName[n.Name] = e
+		co.entries = append(co.entries, e)
+	}
+	for _, e := range co.entries {
+		e.edges = e.node.Edges
+		for _, ed := range e.edges {
+			dep := co.byName[ed.Name]
+			e.deps = append(e.deps, dep)
+			dep.dependents = append(dep.dependents, e)
+		}
+		e.pending = len(e.edges)
+	}
+
+	// A lone leaf node with no restart/scheduler/health opts into exec (PID 1).
+	co.execDefault = len(co.entries) == 1 &&
+		co.entries[0].node.Restart == nil &&
+		co.entries[0].node.Scheduler == nil
+
+	var wg sync.WaitGroup
+	for _, e := range co.entries {
+		wg.Add(1)
+		go co.runNode(e, &wg)
+	}
+
+	// Unblock nodes with no pending dependencies (the DAG's initial frontier).
+	co.mu.Lock()
+	for _, e := range co.entries {
+		if e.pending == 0 {
+			co.closeGo(e)
 		}
 	}
-	return nil
+	co.mu.Unlock()
+
+	wg.Wait()
+	select {
+	case err := <-co.errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+// runNode is each node's goroutine: it waits for its deps to be satisfied,
+// then drives the lifecycle and reports the outcome to the router.
+func (co *coordinator) runNode(e *nodeEntry, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	select {
+	case <-e.goCh:
+	case <-co.chainCtx.Done():
+		// A frontier node (deps already satisfied) still runs so guard-like
+		// validations (e.g. the exec node with active siblings) fire; a node
+		// still waiting on deps bails on shutdown.
+		select {
+		case <-e.goCh:
+		default:
+			return
+		}
+	}
+
+	co.mu.Lock()
+	if e.state == stateSkipped {
+		co.mu.Unlock()
+		co.nodeExited(e, nil) // cascade the skip to e's own dependents
+		return
+	}
+	if e.state != statePending {
+		co.mu.Unlock()
+		return
+	}
+	e.state = stateRunning
+	nodeCtx, nodeCancel := context.WithCancel(co.chainCtx)
+	e.drainCancel = nodeCancel
+	co.mu.Unlock()
+	defer nodeCancel()
+
+	// If a dep permanently exited after satisfying us but before we started,
+	// drain immediately (the dep-exit router also cancels us via drainCancel).
+	err := co.s.runSingleNode(nodeCtx, e, co)
+	co.nodeExited(e, err)
+}
+
+// nodeExited reports a node's permanent exit (or skip) and routes the outcome
+// to its dependents: running dependents drain, not-yet-started dependents are
+// skipped. A fatal (non-Optional) error cancels the whole chain and records it.
+func (co *coordinator) nodeExited(e *nodeEntry, err error) {
+	co.mu.Lock()
+	if e.exitedC {
+		co.mu.Unlock()
+		return
+	}
+	e.exitedC = true
+	close(e.exited)
+	e.state = stateExited
+
+	// A node that permanently exits 0 is a success gate for dependents waiting
+	// on its `exit` edge (a oneshot's success, or a long-running dep that has
+	// stopped). Unblock them before any skip/drain routing below.
+	if err == nil {
+		co.signalExited(e)
+	}
+
+	if err != nil && !e.optional {
+		co.mu.Unlock()
+		co.failChain(err)
+		return
+	}
+	if err != nil && e.optional {
+		co.s.log.Warn("[%s] optional node failed (non-fatal): %v", e.node.Name, err)
+	}
+	// A oneshot that exits 0 is a success gate: its dependents were already
+	// unblocked (started+ready signaled at exit-0), so do NOT drain them. Only
+	// a failed oneshot (err != nil) routes the skip/drain to dependents.
+	if e.node.Oneshot && err == nil {
+		co.mu.Unlock()
+		return
+	}
+	for _, d := range e.dependents {
+		switch d.state {
+		case statePending:
+			if d.goClosed {
+				// The dependent's deps were already satisfied (this node
+				// signaled started/ready), so it will start on its own. Do not
+				// skip it — this preserves the legacy tree desugar guarantee,
+				// where a child starts once its parent's readiness phase
+				// completes even if the parent's process exits around then.
+				continue
+			}
+			d.state = stateSkipped
+			co.closeGo(d) // wake the dependent so it cascades the skip
+			co.s.log.Warn("[%s] skipped: dependency %q did not become ready",
+				d.node.Name, e.node.Name)
+		case stateRunning:
+			if d.drainCancel != nil {
+				d.drainCancel()
+			}
+		}
+	}
+	co.mu.Unlock()
+}
+
+// failChain records the first fatal error and cancels the chain context so all
+// running nodes drain; Run returns the recorded error after the drain.
+func (co *coordinator) failChain(err error) {
+	co.errOnce.Do(func() {
+		co.errCh <- err
+		co.cancel()
+	})
+}
+
+// signalStarted is invoked by a node once its process (or scheduler) has
+// started; it unblocks dependents that wait for this dep to start (WaitStarted).
+func (co *coordinator) signalStarted(e *nodeEntry) {
+	co.mu.Lock()
+	if !e.startedC {
+		e.startedC = true
+		close(e.started)
+		for _, d := range e.dependents {
+			if d.hasEdgeWaiting(e.node.Name, domain.WaitStarted) {
+				co.decrementPending(d)
+			}
+		}
+	}
+	co.mu.Unlock()
+}
+
+// signalReady is invoked by a node once its readiness phase completes; it
+// unblocks dependents that wait for this dep to be ready (WaitReady).
+func (co *coordinator) signalReady(e *nodeEntry) {
+	co.mu.Lock()
+	if !e.readyC {
+		e.readyC = true
+		close(e.ready)
+		for _, d := range e.dependents {
+			if d.hasEdgeWaiting(e.node.Name, domain.WaitReady) {
+				co.decrementPending(d)
+			}
+		}
+	}
+	co.mu.Unlock()
+}
+
+// signalExited unblocks dependents that wait for this dep to permanently exit 0
+// (WaitExit). Called from nodeExited when the node exited cleanly. Must be
+// called with co.mu held.
+func (co *coordinator) signalExited(e *nodeEntry) {
+	for _, d := range e.dependents {
+		if d.hasEdgeWaiting(e.node.Name, domain.WaitExit) {
+			co.decrementPending(d)
+		}
+	}
+}
+
+// hasEdgeWaiting reports whether d waits on the given dep via the given wait
+// mode. Must be called with co.mu held.
+func (d *nodeEntry) hasEdgeWaiting(depName string, mode domain.WaitMode) bool {
+	for _, ed := range d.edges {
+		if ed.Name == depName && ed.WaitFor == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// decrementPending tracks one satisfied dependency of a not-yet-started
+// dependent; when the last dep is satisfied the dependent's goCh is closed.
+// Must be called with co.mu held.
+func (co *coordinator) decrementPending(d *nodeEntry) {
+	if d.state == statePending {
+		d.pending--
+		if d.pending <= 0 {
+			co.closeGo(d)
+		}
+	}
+}
+
+// closeGo closes a node's goCh exactly once. Must be called with co.mu held.
+func (co *coordinator) closeGo(e *nodeEntry) {
+	if e.goClosed {
+		return
+	}
+	e.goClosed = true
+	close(e.goCh)
 }
 
 // beginActive records that a supervised process is starting.
@@ -92,17 +395,28 @@ func (s *Service) hasActiveSiblings() bool {
 	return s.active > 0
 }
 
-// runNode drives a single ProcessNode through its lifecycle. execDefault is
-// true when this node is a lone leaf root that should exec by default.
-//
-// Children (both needParentReady and not) are supervised concurrently with the
-// parent in goroutines. needParentReady children wait for the parent's
-// readiness probe before starting. When the parent's supervision ends (process
-// exit without restart, or context cancellation), the node's context is
-// cancelled so all children drain. The first error from any goroutine cancels
-// the node and fails fast (init-style children like stanza-create must not
-// silently fail while sidecars keep running).
-func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefault bool) error {
+// runSingleNode drives a single node through its lifecycle: provision →
+// probe-gated start → readiness → supervise → graceful drain. It is the flat
+// DAG equivalent of the old recursive runNode minus the spawnChildren calls —
+// child spawning/draining is now the coordinator's job via the event router.
+// It signals the node's started/ready transitions to the coordinator and
+// returns when the node permanently exits (process gone, no restart left) or is
+// drained, so the caller reports the exit to the router.
+func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinator) error {
+	node := e.node
+
+	// A oneshot node runs its Process to completion instead of supervising it
+	// as a long-running service. On exit code 0 it signals started+ready+exited
+	// and its dependents start; on non-zero it fails (fatal unless Optional).
+	// Mutually exclusive with Exec/Scheduler/Health (validated in ValidateChain,
+	// re-checked here defensively).
+	if node.Oneshot {
+		if node.Exec || node.Scheduler != nil || node.Health != nil {
+			return fmt.Errorf("node %q cannot combine Oneshot with Exec/Scheduler/Health", node.Name)
+		}
+		return s.runOneshot(ctx, e, co)
+	}
+
 	// Provision files before starting the process.
 	if err := repository.ProvisionFiles(node.Files); err != nil {
 		s.log.Error("[%s] file provisioning failed: %v", node.Name, err)
@@ -121,8 +435,8 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 
 	// exec and Health are mutually exclusive: exec replaces PID 1 (ezx
 	// vanishes), health requires ezx to stay alive. execDefault makes a lone
-	// leaf root exec unless it opts into supervision via Health or Scheduler.
-	execNode := node.Exec || (execDefault && node.Health == nil && node.Scheduler == nil)
+	// chain node exec unless it opts into supervision via Health or Scheduler.
+	execNode := node.Exec || (co.execDefault && node.Health == nil && node.Scheduler == nil)
 	if node.Exec && node.Health != nil {
 		return fmt.Errorf("node %q cannot have both Exec and Health set", node.Name)
 	}
@@ -138,11 +452,15 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 	}
 
 	// A scheduled node runs its Process on a cron ticker (with manual triggers)
-	// instead of once. It is supervised and drained like a regular process.
+	// instead of once. It is supervised and drained like a regular process and
+	// participates in the graph as any node: started when the scheduler starts,
+	// ready immediately (dependents of a scheduled node use start-gating).
 	if node.Scheduler != nil {
 		if node.Exec || node.Health != nil {
 			return fmt.Errorf("node %q cannot combine Scheduler with Exec or Health", node.Name)
 		}
+		co.signalStarted(e)
+		co.signalReady(e)
 		return s.runScheduled(ctx, node)
 	}
 
@@ -164,6 +482,7 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 	if node.OnStart != nil {
 		node.OnStart()
 	}
+	co.signalStarted(e)
 
 	// Relay selected signals from ezx (PID 1) to the child process group.
 	var fwd *repository.Forwarder
@@ -195,8 +514,8 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 		defer pollCancel()
 	}
 
-	// Wait for readiness before returning to children that may need it. A
-	// JS-driven ReadinessFunc overrides the declarative Readiness probe; both
+	// Wait for readiness before signaling ready to dependents that may need it.
+	// A JS-driven ReadinessFunc overrides the declarative Readiness probe; both
 	// then set the health/readiness state and fire OnReady identically.
 	if node.ReadinessFunc != nil {
 		s.log.Info("[%s] waiting for readiness (callback)", node.Name)
@@ -226,65 +545,96 @@ func (s *Service) runNode(ctx context.Context, node domain.ProcessNode, execDefa
 			node.OnReady()
 		}
 	}
+	co.signalReady(e)
 
-	// Supervise the parent and every child concurrently. Cancelling nodeCtx
-	// (parent supervision ended, or a child failed) drains the whole subtree.
-	nodeCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(node.Children)+1)
-
-	// Children not requiring parent readiness run concurrently with the parent.
-	s.spawnChildren(nodeCtx, node, false, &wg, errCh, cancel)
-	// Children requiring parent readiness run concurrently once the parent is up.
-	s.spawnChildren(nodeCtx, node, true, &wg, errCh, cancel)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := s.supervise(nodeCtx, node, proc); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
-		// Parent supervision ended: drain the children.
-		cancel()
-	}()
-
-	wg.Wait()
-	select {
-	case err := <-errCh:
-		return err
-	default:
-		return nil
-	}
+	// Supervise the process until it exits or the node context is cancelled
+	// (chain shutdown, a dependency permanently exited, or a fatal sibling).
+	return s.supervise(ctx, node, proc)
 }
 
-// spawnChildren launches each matching child (by needParentReady) in its own
-// goroutine, supervised concurrently with the parent. The first child error is
-// reported on errCh and cancels the node so siblings and the parent drain.
-func (s *Service) spawnChildren(ctx context.Context, node domain.ProcessNode, needReady bool, wg *sync.WaitGroup, errCh chan error, cancel context.CancelFunc) {
-	for _, child := range node.Children {
-		if child.NeedParentReady != needReady {
-			continue
+// runOneshot drives a oneshot node: it provisions files, builds args, starts
+// the process, and waits for it to run to completion. On exit code 0 it signals
+// started+ready (unblocking dependents — a oneshot is "ready" only when it
+// exits 0) and returns nil; on non-zero it retries up to Restart.MaxRetries,
+// then fails (fatal unless Optional). It mirrors runSingleNode's
+// provision/args/start, but instead of supervising a long-running process it
+// waits for the oneshot to finish.
+func (s *Service) runOneshot(ctx context.Context, e *nodeEntry, co *coordinator) error {
+	node := e.node
+	// Provision files before starting the process.
+	if err := repository.ProvisionFiles(node.Files); err != nil {
+		s.log.Error("[%s] file provisioning failed: %v", node.Name, err)
+		return err
+	}
+
+	// Build arguments from the process environment, then create the handle so
+	// the enriched arguments reach the spawned process.
+	env := os.Environ()
+	args, err := repository.BuildArgs(node.Process, env)
+	if err != nil {
+		s.log.Error("[%s] argument build failed: %v", node.Name, err)
+		return err
+	}
+	node.Process.Arguments = args
+
+	proc := s.proc(node)
+	s.beginActive()
+	lc := s.logConfig(node)
+	if err := proc.Start(ctx, env, lc); err != nil {
+		s.endActive()
+		s.log.Error("[%s] oneshot start failed: %v", node.Name, err)
+		return err
+	}
+	s.log.Info("[%s] oneshot started (pid=%d)", node.Name, proc.PID())
+
+	// On success, end the active window BEFORE signaling started+ready so the
+	// exec guard (hasActiveSiblings) never sees this oneshot as still active
+	// when its dependents (e.g. the exec node) fire. On failure, no signaling.
+	success := false
+	defer func() {
+		s.endActive()
+		if success {
+			co.signalStarted(e)
+			co.signalReady(e)
 		}
-		wg.Add(1)
-		go func(c domain.ProcessNode) {
-			defer wg.Done()
-			if err := s.runNode(ctx, c, false); err != nil {
-				if c.Optional {
-					s.log.Warn("[%s] optional child failed (non-fatal): %v", c.Name, err)
-					return
-				}
-				select {
-				case errCh <- err:
-					cancel()
-				default:
-				}
+	}()
+
+	// Wait for completion, applying Restart.MaxRetries.
+	retries := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return s.drain(ctx, proc, s.resolveShutdown(node))
+		case <-proc.Done():
+			code, werr := proc.Wait()
+			s.log.Info("[%s] oneshot finished (code=%d)", node.Name, code)
+			if node.OnExit != nil {
+				node.OnExit(code)
 			}
-		}(child)
+			if code == 0 {
+				// Success: unblock dependents (a oneshot is "ready" only when
+				// it exits 0).
+				success = true
+				return nil
+			}
+			// Failure: retry if allowed.
+			if node.Restart != nil && node.Restart.MaxRetries > 0 && retries < node.Restart.MaxRetries {
+				retries++
+				backoff := s.backoff(node)
+				s.log.Info("[%s] oneshot failed, retrying in %v", node.Name, backoff)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				proc = s.proc(node)
+				if err := proc.Start(ctx, env, lc); err != nil {
+					return err
+				}
+				continue
+			}
+			return s.exitCodeErr(code, werr) // fatal unless Optional
+		}
 	}
 }
 
