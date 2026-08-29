@@ -295,6 +295,22 @@ func TestScheduledNodeAutonomousCronTickFires(t *testing.T) {
 	procs := map[string]*fakeProc{}
 	svc := newTestService(procs)
 
+	// Drive the scheduler with a fake clock: now() returns a mutable time,
+	// and sleep(d) advances the clock by d and fires immediately. This lets
+	// the autonomous cron tick fire on the next minute boundary without
+	// waiting up to 60s on the real wall clock.
+	base := time.Date(2026, 8, 29, 14, 5, 30, 0, time.UTC)
+	clock := base
+	svc.SetClock(
+		func() time.Time { return clock },
+		func(d time.Duration) <-chan time.Time {
+			clock = clock.Add(d)
+			ch := make(chan time.Time, 1)
+			ch <- clock
+			return ch
+		},
+	)
+
 	var mu sync.Mutex
 	ticks := 0
 	chain := domain.ProcessChain{
@@ -320,9 +336,11 @@ func TestScheduledNodeAutonomousCronTickFires(t *testing.T) {
 	go func() { runDone <- svc.Run(ctx, chain) }()
 	waitScheduled(t, svc, "job")
 
-	// An autonomous (non-trigger) cron tick fires on the next minute boundary
-	// (within <=60s); wait up to ~65s for it.
-	deadline := time.Now().Add(65 * time.Second)
+	// The autonomous cron tick fires on the next minute boundary. With the
+	// fake clock, the scheduler's sleep advances the clock to 14:06:00 and
+	// fires immediately, so the tick should fire within a short real-time
+	// window (no 60s wall-clock wait).
+	deadline := time.Now().Add(2 * time.Second)
 	for {
 		mu.Lock()
 		n := ticks
@@ -333,7 +351,7 @@ func TestScheduledNodeAutonomousCronTickFires(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("autonomous cron tick never fired")
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	cancel()

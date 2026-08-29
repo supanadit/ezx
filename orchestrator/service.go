@@ -29,6 +29,15 @@ type Service struct {
 	log    logger.Logger
 	health domain.HealthService
 
+	// now returns the current time. It is injectable so tests can drive the
+	// scheduler deterministically (e.g. jump to the next cron boundary)
+	// instead of sleeping on the real wall clock. Defaults to time.Now.
+	now func() time.Time
+	// sleep returns a channel that fires after d. It is injectable so tests
+	// can advance the fake clock and fire the timer without blocking on the
+	// real wall clock. Defaults to time.After.
+	sleep func(d time.Duration) <-chan time.Time
+
 	mu        sync.Mutex
 	active    int
 	triggers  map[string]*domain.Trigger
@@ -46,8 +55,21 @@ func NewService(
 		proc:      proc,
 		log:       log,
 		health:    health,
+		now:       time.Now,
+		sleep:     time.After,
 		triggers:  make(map[string]*domain.Trigger),
 		schedules: make(map[string]*repository.Cron),
+	}
+}
+
+// SetClock overrides the scheduler's time source and sleep. It is intended for
+// tests; passing nil for either restores the real wall clock / time.After.
+func (s *Service) SetClock(now func() time.Time, sleep func(d time.Duration) <-chan time.Time) {
+	if now != nil {
+		s.now = now
+	}
+	if sleep != nil {
+		s.sleep = sleep
 	}
 }
 
@@ -897,21 +919,21 @@ func (s *Service) runScheduled(ctx context.Context, node domain.ProcessNode) err
 
 	var lastRun time.Time
 	for {
-		now := time.Now().In(loc)
+		now := s.now().In(loc)
 		next := cron.Next(now)
 		var timer <-chan time.Time
 		wait := next.Sub(now)
 		if wait < 0 {
 			wait = 0
 		}
-		timer = time.After(wait)
+		timer = s.sleep(wait)
 
 		select {
 		case <-ctx.Done():
 			s.log.Info("[%s] context cancelled, draining scheduler", node.Name)
 			return nil
 		case <-timer:
-			if time.Now().Before(next) {
+			if s.now().Before(next) {
 				// timer fired slightly early (clock); recompute on next pass.
 				continue
 			}
@@ -921,7 +943,7 @@ func (s *Service) runScheduled(ctx context.Context, node domain.ProcessNode) err
 			if err := s.runTick(ctx, node, shutdown, env, lc); err != nil {
 				return err
 			}
-			lastRun = time.Now()
+			lastRun = s.now()
 		case <-trigger.C():
 			if time.Since(lastRun) < minInterval {
 				continue
@@ -929,7 +951,7 @@ func (s *Service) runScheduled(ctx context.Context, node domain.ProcessNode) err
 			if err := s.runTick(ctx, node, shutdown, env, lc); err != nil {
 				return err
 			}
-			lastRun = time.Now()
+			lastRun = s.now()
 		}
 	}
 }
