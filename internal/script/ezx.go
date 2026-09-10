@@ -45,6 +45,9 @@ type EzxModule struct {
 	Log       *LogModule       `goja:"log"`
 	Chain     *ChainModule     `goja:"chain"`
 	FS        *FSModule        `goja:"fs"`
+	Net       *NetModule       `goja:"net"`
+	Crypto    *CryptoModule    `goja:"crypto"`
+	Archive   *ArchiveModule   `goja:"archive"`
 	Health    *HealthModule    `goja:"health"`
 	Probe     *ProbeModule     `goja:"probe"`
 	Scheduler *SchedulerModule `goja:"scheduler"`
@@ -63,6 +66,9 @@ func NewEzxModule(d Deps) *EzxModule {
 		Log:       NewLogModule(d.Log),
 		Chain:     NewChainModule(d.Ctx, d.Chain),
 		FS:        NewFSModule(),
+		Net:       NewNetModule(d.Ctx),
+		Crypto:    NewCryptoModule(),
+		Archive:   NewArchiveModule(),
 		Health:    NewHealthModule(d.Ready),
 		Probe:     NewProbeModule(d.Ctx),
 		Scheduler: NewSchedulerModule(d.Sched, d.Callbacks),

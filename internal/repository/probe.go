@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -48,6 +49,36 @@ func Check(ctx context.Context, probe domain.Probe) (bool, error) {
 }
 
 func checkOnce(ctx context.Context, probe domain.Probe) (bool, error) {
+	// Per-attempt timeout default: apply at every level so recursive sub-probes
+	// (Any/All) get a sane per-attempt budget too — without this, a zero
+	// Timeout makes context.WithTimeout(ctx, 0) fire immediately.
+	if probe.Timeout <= 0 {
+		probe.Timeout = time.Second
+	}
+	// Any/All composition takes precedence over the single Type check.
+	if len(probe.Any) > 0 {
+		var lastErr error
+		for _, sub := range probe.Any {
+			ok, err := checkOnce(ctx, *sub)
+			if err == nil && ok {
+				return true, nil
+			}
+			lastErr = err
+		}
+		if lastErr != nil {
+			return false, lastErr
+		}
+		return false, nil
+	}
+	if len(probe.All) > 0 {
+		for _, sub := range probe.All {
+			ok, err := checkOnce(ctx, *sub)
+			if err != nil || !ok {
+				return ok, err
+			}
+		}
+		return true, nil
+	}
 	switch probe.Type {
 	case domain.ProbeTypeTCP:
 		return checkTCP(ctx, probe)
@@ -65,6 +96,12 @@ func checkExec(ctx context.Context, probe domain.Probe) (bool, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, probe.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, probe.Exec[0], probe.Exec[1:]...)
+	// Probe env: inherit the parent, then append the probe's KEY=VALUE entries
+	// (e.g. PGPASSWORD=... so a psql gate can authenticate without a shell
+	// wrapper or a .pgpass file).
+	if len(probe.Env) > 0 {
+		cmd.Env = append(os.Environ(), probe.Env...)
+	}
 	// When ExecExpect is set, capture stdout so the probe can gate on the
 	// command's output in addition to its exit code.
 	if probe.ExecExpect != "" {

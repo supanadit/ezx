@@ -173,6 +173,47 @@ func (m *FSModule) EnsureDir(path string, opts ...writeOpts) error {
 	return nil
 }
 
+// copyOpts holds options for fs.copy and fs.copyTree. Overwrite is a *bool so
+// the default (true, matching cp) applies when the option is omitted.
+type copyOpts struct {
+	// Overwrite replaces existing dest entries; default true.
+	Overwrite *bool
+	// Dereference copies the targets of symlinks instead of recreating them.
+	Dereference bool
+	// PreserveOwner copies uid/gid from source entries; best-effort.
+	PreserveOwner bool
+}
+
+// Copy copies src (file or directory) to dest. Directories are copied
+// recursively with modes preserved (cp -a style). Symlinks are recreated by
+// default; pass { dereference: true } to follow them. Existing dest entries
+// are replaced unless { overwrite: false }.
+func (m *FSModule) Copy(src, dest string, opts ...copyOpts) error {
+	o := repository.CopyOptions{Overwrite: true}
+	if len(opts) > 0 {
+		if opts[0].Overwrite != nil {
+			o.Overwrite = *opts[0].Overwrite
+		}
+		o.Dereference = opts[0].Dereference
+		o.PreserveOwner = opts[0].PreserveOwner
+	}
+	return repository.Copy(src, dest, o)
+}
+
+// CopyTree copies the directory src into dest recursively. Same options as
+// fs.copy; keeps recursive intent explicit for callers.
+func (m *FSModule) CopyTree(src, dest string, opts ...copyOpts) error {
+	o := repository.CopyOptions{Overwrite: true}
+	if len(opts) > 0 {
+		if opts[0].Overwrite != nil {
+			o.Overwrite = *opts[0].Overwrite
+		}
+		o.Dereference = opts[0].Dereference
+		o.PreserveOwner = opts[0].PreserveOwner
+	}
+	return repository.CopyTree(src, dest, o)
+}
+
 // Which reports whether cmd resolves on PATH (command -v).
 func (m *FSModule) Which(cmd string) bool {
 	return repository.Which(cmd)

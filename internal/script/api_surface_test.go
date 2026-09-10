@@ -27,7 +27,7 @@ var expectedAPISurface = []apiSurface{
 		"open",
 	}},
 	{name: "process", methods: []string{
-		"spawn", "exec", "run", "capture", "shell",
+		"spawn", "exec", "run", "capture", "shell", "sleep",
 	}},
 	{name: "log", methods: []string{
 		"debug", "info", "warn", "error", "enabled",
@@ -39,7 +39,16 @@ var expectedAPISurface = []apiSurface{
 		"stat", "exists", "mkdir", "mkdirAll", "chmod", "chmodRecursive",
 		"chown", "chownRecursive", "readDir", "glob", "remove", "removeAll",
 		"symlink", "realpath", "tempFile", "tempDir", "umask", "rename",
-		"write", "ensureDir", "which",
+		"write", "ensureDir", "which", "copy", "copyTree",
+	}},
+	{name: "net", methods: []string{
+		"http", "download",
+	}},
+	{name: "crypto", methods: []string{
+		"sha256", "sha256File", "base64Encode", "base64Decode", "randomHex",
+	}},
+	{name: "archive", methods: []string{
+		"extract", "create",
 	}},
 	{name: "health", methods: []string{
 		"setReady", "ready",

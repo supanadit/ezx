@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/internal/repository"
@@ -117,6 +118,10 @@ type runOpts struct {
 	OnStdout any
 	// OnStderr is an optional JS callable invoked per captured stderr line.
 	OnStderr any
+	// Timeout bounds the process lifetime in nanoseconds (0 = no bound). On
+	// expiry the process is terminated with SIGKILL via context cancellation —
+	// the native replacement for timeout(1).
+	Timeout int64
 	// Check throws on a non-zero exit.
 	Check bool
 }
@@ -193,16 +198,27 @@ type shellOpts struct {
 }
 
 // oneshot spawns the process, waits, returns the exit code and any captured
-// stdout/stderr, and delivers streaming callbacks (if any) post-hoc.
+// stdout/stderr, and delivers streaming callbacks (if any) post-hoc. A
+// positive opts.Timeout derives a timeout context (timeout(1) equivalent).
 func (m *ProcessModule) oneshot(opts runOpts, lc domain.LogConfig) (code int, stdout, stderr string, err error) {
 	node := domain.ProcessNode{Name: opts.Name, Process: opts.Process}
 	proc := m.factory(node)
-	if err := proc.Start(m.ctx, os.Environ(), lc); err != nil {
+
+	startCtx := m.ctx
+	var cancel context.CancelFunc
+	if opts.Timeout > 0 {
+		startCtx, cancel = context.WithTimeout(m.ctx, time.Duration(opts.Timeout))
+		defer cancel()
+	}
+	if err := proc.Start(startCtx, os.Environ(), lc); err != nil {
 		return -1, "", "", err
 	}
 	code, err = proc.Wait()
 	if err != nil {
 		return code, "", "", err
+	}
+	if startCtx.Err() == context.DeadlineExceeded {
+		return code, "", "", fmt.Errorf("process %q timed out", opts.Process.BinaryPath)
 	}
 	if lc.Stdout == domain.LogDestCapture {
 		stdout, stderr = proc.Output()
@@ -210,6 +226,23 @@ func (m *ProcessModule) oneshot(opts runOpts, lc domain.LogConfig) (code int, st
 		deliverLines(m.inv, opts.OnStderr, stderr)
 	}
 	return code, stdout, stderr, nil
+}
+
+// Sleep blocks the script for the given duration in nanoseconds — the native
+// replacement for sleep(1) (e.g. process.sleep(2e9) = 2 seconds). Sleeping
+// does not block the Go runtime; the interrupted-context is not consumed.
+func (m *ProcessModule) Sleep(ns int64) error {
+	if ns < 0 {
+		return fmt.Errorf("process.sleep: negative duration")
+	}
+	timer := time.NewTimer(time.Duration(ns))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-m.ctx.Done():
+		return m.ctx.Err()
+	}
 }
 
 // deliverLines invokes fn once per non-empty line of out (post-hoc line

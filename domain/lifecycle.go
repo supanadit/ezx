@@ -24,8 +24,20 @@ const (
 type Probe struct {
 	// Type selects which check runs (exec/tcp/http). Empty defaults to exec.
 	Type ProbeType
+	// Any, when non-empty, is a list of probes of which at least one must pass
+	// for this probe to pass (OR composition). It composes with Type but takes
+	// precedence: when Any is set, Type is ignored and this probe passes when
+	// any single sub-probe passes. Used for "/master OR /leader" role gates.
+	Any []*Probe
+	// All, when non-empty, is a list of probes of which every one must pass for
+	// this probe to pass (AND composition). When All is set, Type is ignored.
+	All []*Probe
 	// Exec is the command (and args) to run for ProbeTypeExec.
 	Exec []string
+	// Env is a slice of "KEY=VALUE" environment entries added to the exec
+	// probe's process environment (e.g. "PGPASSWORD=secret" for a psql probe).
+	// Entries are appended to the inherited environment at check time.
+	Env []string
 	// ExecExpect, when non-empty, requires the probe's stdout to contain the
 	// substring for the probe to be ready (in addition to a zero exit code).
 	// This lets a command whose exit code is always zero still gate readiness,

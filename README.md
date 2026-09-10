@@ -5,7 +5,7 @@
 `ezx` replaces fragile bash `entrypoint.sh` trees (sed/awk config rewriting,
 `sleep`-based readiness polling, `pgrep`-polling supervision) with a single
 binary driven by a declarative JavaScript script. It spawns and supervises
-dependency trees of processes, converts environment variables into config
+dependency graphs of processes, converts environment variables into config
 files and CLI arguments, strips secrets before spawning children, and handles
 PID-1 init duties (zombie reaping, signal forwarding, graceful drain) —
 all without a line of shell.
@@ -66,11 +66,10 @@ into the same graph at bind time:
 | X fails (`Optional`)                     | dependents of X are skipped (with a warning)                       | continues                               |
 | context cancelled (SIGTERM / script end) | all running nodes drain concurrently                               | `run` returns after drain               |
 
-Per-edge wait modes close the last s6-overlay gap: a node can wait for one dep
-to be `ready`, another to merely `start`, and a oneshot to `exit 0` — all on
-the same node.
+Per-edge wait modes let a node wait for one dependency to be `ready`, another
+to merely `start`, and a oneshot to `exit 0` — all on the same node.
 
-### Two modes — the part s6-overlay can't match
+### Two launch modes
 
 Every node selects how its main process is launched:
 
@@ -86,9 +85,13 @@ Every node selects how its main process is launched:
   `shutdown`, and dependency edges via `dependsOn`/`dependsOnEdges` (or the
   legacy `children` tree form). ezx reaps zombies and forwards signals.
 
-s6-overlay never lets your app be PID 1 — its `/init` is always PID 1. ezx
-lets you choose: hand PID 1 to your app for native signals, or keep ezx as PID
-1 for supervision, health, scheduling, and dependency ordering.
+ezx is an **alternative to tini and dumb-init** that goes further. Those tools
+reap zombies and forward a couple of signals — and that's the whole job. ezx
+does the init duties you expect from them, and adds a declarative control
+plane on top: env→config files, env→CLI args, secret filtering, a dependency
+graph, health probes, scheduling, and per-service logging. With an `exec`
+node you hand PID 1 to your app for native signals, or you keep ezx as PID 1
+for supervision.
 
 ### Oneshot services & "init DAG → exec main"
 
@@ -101,7 +104,7 @@ imperative `process.run` one-shot, composed into the dependency graph:
   non-zero exit fails the node (fatal unless `optional`), skipping its
   dependents.
 - **Retryable.** `restart` on a oneshot retries it on failure up to
-  `MaxRetries` (s6-rc oneshot semantics).
+  `MaxRetries` (the classic run-to-completion supervisor model).
 - **Mutually exclusive** with `exec`, `scheduler`, `health`, and
   `needParentReady` (a oneshot is "ready" only when it exits 0) — validated
   fail-fast at chain validation.
@@ -127,9 +130,8 @@ Try it: `./ezx bootstrap examples/bootstrap/oneshot-init.js`.
 
 ### The env-driven deterministic model
 
-The other differentiator vs s6-overlay (which has no env→config, env→args, env
-filtering, or declarative file provisioning — you write shell scripts for all
-that):
+Where an init tool stops at reaping and signal forwarding, ezx keeps going —
+everything below is declared in JavaScript, no shell:
 
 - **File provisioning** — `{ type: "set-property", fromEnvPattern:
 "^POSTGRESQL_CONFIG_(.+)$", nameTransform: "lower", ... }` turns any matching
@@ -157,9 +159,8 @@ that):
 ### Per-service logging with rotation
 
 Each supervised process can route its stdout/stderr to its own **file-backed log
-destination with size-based rotation** — closing the per-service supervised
-logging gap vs s6-overlay. Set `log.stdout`/`log.stderr` to `"file"` and point
-`filePath` at the target:
+destination with size-based rotation**. Set `log.stdout`/`log.stderr` to `"file"`
+and point `filePath` at the target:
 
 ```js
 process: {
@@ -198,8 +199,11 @@ The aggregate module exposed to scripts:
 | ----------- | ----------------------------------------------------------------------------- |
 | `env`       | Read env with defaults, `isTruthy`, pattern enumeration                       |
 | `editor`    | Imperative file editing (`open`, `upsert`, `replace`, `append`, `remove`)     |
-| `fs`        | `mkdirAll`, `chmod`, `chownRecursive`, `readDir`, `exists`, `remove`, `umask` |
-| `process`   | Low-level spawn / signal / wait / exec (privilege drop via `user`/`group`)    |
+| `fs`        | `mkdirAll`, `chmod`, `chownRecursive`, `readDir`, `exists`, `remove`, `umask`, `copy`/`copyTree` (cp -a) |
+| `net`       | Native HTTP client (`http`) + streaming download with SHA-256 verify (`download`) — no curl |
+| `crypto`    | `sha256`, `sha256File`, `base64Encode`/`base64Decode`, `randomHex` — no sha256sum |
+| `archive`   | `create`/`extract` for tar, tar.gz, zip, .gz — no tar/gunzip            |
+| `process`   | Low-level spawn / signal / wait / exec, `sleep`, `run`/`capture` with `timeout` — no sleep/timeout |
 | `chain`     | High-level declarative process graph (`chain.run({ nodes: [...] })`) |
 | `config`    | Declarative config builder (`key=value`, tables, INI, fluent builder)         |
 | `yaml`      | Deterministic YAML serialization                                              |
@@ -257,6 +261,9 @@ EZX_HEALTH_ADDR=:8080 \
 
 # Oneshot services + "init DAG → exec main" (declarative init steps → exec)
 ./ezx bootstrap examples/bootstrap/oneshot-init.js
+
+# Native stdlib-only replacements for curl/cp -a/sha256sum/tar/sleep/timeout
+./ezx bootstrap examples/bootstrap/native-ops.js
 ```
 
 ### PostgreSQL container example
@@ -296,20 +303,24 @@ No `ezx/alpha` / `ezx/beta` modules are registered: an alias only protects
 users if surfaces can diverge, and parallel facades pay maintenance cost before
 there are users to protect. The compat test is the freeze.
 
-Remaining gaps vs a full s6-overlay-style supervisor:
+ezx draws inspiration from the init supervisor tradition (tini, dumb-init,
+and s6-overlay's supervision model) but is its own thing: single static
+binary, declarative JavaScript, env-driven determinism — built as a friendly
+alternative to the simplest init tools while going far beyond them.
 
-There are none — ezx has full s6-overlay parity on the supervision model:
-dependency graph, per-edge wait modes, oneshots, init-DAG → exec, logging
-rotation, exit-code propagation, restart, health, and scheduling — plus the
-env-driven determinism s6 lacks.
+Its supervision model covers dependency graphs, per-edge wait modes, oneshot
+services, the init-DAG → exec-main pattern, per-service logging with rotation,
+exit-code propagation, restart policies, health probes, and scheduling —
+declared in JavaScript, no shell.
 
 Distribution is a single static binary + checksums on GitHub Releases, and is
 installable via `go install github.com/supanadit/ezx/app@<version>`. The
 release pipeline builds the binaries and checksums on every semver tag.
 
-The design goal is to take s6's semantics (supervision, restart policy,
-dependency ordering, exit-code propagation) while keeping ezx's model (JS +
-env-driven determinism) — a differentiated product, not a clone.
+The design goal is to take the supervision ideas of the init tradition
+(supervision, restart policy, dependency ordering, exit-code propagation)
+while keeping ezx's model (JS + env-driven determinism) — a friendly
+alternative to tini and dumb-init that goes far beyond either.
 
 ## License
 
