@@ -13,7 +13,7 @@ func TestLoggerLiteralPercent(t *testing.T) {
 	// No args: message is literal, "%p" must not mangle.
 	msg := "archive_command: env -u X pgbackrest archive-push %p"
 	emit := func(f string, a ...any) { l.Info(f, a...) }
-	emit(msg)
+	emit("%s", msg)
 	if got := buf.String(); !bytes.Contains([]byte(got), []byte("archive-push %p")) {
 		t.Errorf("literal %% mangled by Sprintf: %q", got)
 	}

@@ -32,6 +32,12 @@ type ProcessRepository struct {
 	reaper *Reaper
 	code   int
 
+	// doneMu protects doneClosed to ensure done is closed exactly once.
+	// Used by closeDoneOnce() which may be called from Kill() for
+	// callback-only nodes.
+	doneMu     sync.Mutex
+	doneClosed bool
+
 	// stdoutBuf/stderrBuf buffer output when the node is started with
 	// LogDestCapture for the corresponding stream.
 	stdoutBuf bytes.Buffer
@@ -64,6 +70,16 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 		return nil
 	}
 	s.start = true
+
+	// A callback-only node (empty BinaryPath) has no process to spawn.
+	// For oneshot nodes, mark it done immediately so the oneshot completes.
+	// For regular nodes, leave Done() open so the node blocks forever (keepalive).
+	if s.node.Process.BinaryPath == "" {
+		if s.node.Oneshot {
+			close(s.done)
+		}
+		return nil
+	}
 
 	procEnv, err := repository.BuildProcessEnv(env, s.node.Process)
 	if err != nil {
@@ -183,9 +199,12 @@ func (s *ProcessRepository) Signal(sig os.Signal) error {
 	return s.cmd.Process.Signal(sig)
 }
 
-// Kill force-terminates the process.
+// Kill force-terminates the process. For callback-only nodes (empty
+// BinaryPath, no real process), closing done is enough to unblock drain.
 func (s *ProcessRepository) Kill() error {
 	if s.cmd == nil || s.cmd.Process == nil {
+		// No process spawned — ensure done is closed so drain unblocks.
+		s.closeDoneOnce()
 		return nil
 	}
 	return s.cmd.Process.Kill()
@@ -237,6 +256,18 @@ func (s *ProcessRepository) closeFileWriters() {
 	for path, w := range s.fileWriters {
 		_ = w.Close()
 		delete(s.fileWriters, path)
+	}
+}
+
+// closeDoneOnce closes s.done exactly once. Used by Kill/Signal for
+// callback-only nodes that have no real process — closing done unblocks
+// drain during shutdown.
+func (s *ProcessRepository) closeDoneOnce() {
+	s.doneMu.Lock()
+	defer s.doneMu.Unlock()
+	if !s.doneClosed {
+		close(s.done)
+		s.doneClosed = true
 	}
 }
 

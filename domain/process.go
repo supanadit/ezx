@@ -6,7 +6,11 @@ package domain
 // extensibility is prioritized for future logic (e.g., spawning code can add checks or defaults).
 // Fields are designed for optionality: slices can be nil/empty, strings default to empty (meaning "use system default" in logic).
 type Process struct {
-	// BinaryPath is the absolute or relative path to the executable binary (required; empty means invalid).
+	// BinaryPath is the absolute or relative path to the executable binary.
+	// Empty means "callback-only" node: no process is spawned; the node
+	// completes immediately after OnStart (if set) returns. Used for oneshot
+	// init tasks that are pure JS/Go callbacks, or for keepalive nodes that
+	// hold the container open without running an external binary.
 	BinaryPath string
 	// Arguments is a slice of command-line arguments. Entries may contain ${VAR} and
 	// ${VAR:-default} interpolation resolved from the environment at spawn time
