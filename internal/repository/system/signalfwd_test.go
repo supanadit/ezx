@@ -1,6 +1,6 @@
 //go:build linux
 
-package repository
+package system
 
 import (
 	"context"
@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/supanadit/ezx/internal/repository"
 )
 
 func TestResolveForwardSignals(t *testing.T) {
@@ -19,8 +21,8 @@ func TestResolveForwardSignals(t *testing.T) {
 	if len(sigs) != 2 {
 		t.Fatalf("len(sigs) = %d, want 2 (deduplicated)", len(sigs))
 	}
-	if _, ok := SignalName("BOGUS"); ok {
-		t.Fatal("SignalName(BOGUS) should be false")
+	if _, ok := repository.SignalName("BOGUS"); ok {
+		t.Fatal("repository.SignalName(BOGUS) should be false")
 	}
 	if _, err := ResolveForwardSignals([]string{"BOGUS"}); err == nil {
 		t.Fatal("ResolveForwardSignals should error on unknown signal")

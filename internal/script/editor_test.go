@@ -1,6 +1,7 @@
 package script
 
 import (
+	"github.com/supanadit/ezx/internal/repository/system"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +16,7 @@ func TestEditorModuleOpenAndRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := NewEditorModule()
+	m := NewEditorModule(system.NewAdapter())
 	ed := m.Open(target)
 	if ed.Path() != target {
 		t.Fatalf("Path() = %q, want %q", ed.Path(), target)
@@ -36,7 +37,7 @@ func TestEditorModuleWriteAndMutate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ed := NewEditorModule().Open(target)
+	ed := NewEditorModule(system.NewAdapter()).Open(target)
 
 	// WriteLines
 	if err := ed.WriteLines([]string{"x=1", "y=2"}); err != nil {
@@ -122,7 +123,7 @@ func TestEditorModuleWriteAndMutate(t *testing.T) {
 
 func TestEditorModuleReadMissingReturnsEmpty(t *testing.T) {
 	dir := t.TempDir()
-	ed := NewEditorModule().Open(filepath.Join(dir, "missing"))
+	ed := NewEditorModule(system.NewAdapter()).Open(filepath.Join(dir, "missing"))
 	if got := ed.Read(); got != "" {
 		t.Fatalf("Read() = %q, want empty", got)
 	}

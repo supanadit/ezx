@@ -1,4 +1,4 @@
-package repository
+package system
 
 import (
 	"errors"
@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository"
 )
 
 func TestBuildArgsInterpolationDefault(t *testing.T) {
@@ -274,7 +275,7 @@ func TestBuildArgsNumericGating(t *testing.T) {
 				Flag:    "-ingester.max-global-series-per-tenant",
 				FromEnv: "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT",
 				ConditionFunc: func(environ []string) bool {
-					v := Get(environ, "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT", "")
+					v := repository.Get(environ, "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT", "")
 					n, err := strconv.Atoi(v)
 					return err == nil && n > 0
 				},
@@ -299,7 +300,7 @@ func TestBuildArgsNumericGatingZeroSkips(t *testing.T) {
 				Flag:    "-ingester.max-global-series-per-tenant",
 				FromEnv: "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT",
 				ConditionFunc: func(environ []string) bool {
-					v := Get(environ, "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT", "")
+					v := repository.Get(environ, "PYROSCOPE_INGESTER_MAX_GLOBAL_SERIES_PER_TENANT", "")
 					n, err := strconv.Atoi(v)
 					return err == nil && n > 0
 				},
@@ -324,7 +325,7 @@ func TestBuildArgsArgsFuncOverride(t *testing.T) {
 		},
 		ArgsFunc: func(environ []string) ([]string, error) {
 			var args []string
-			if Get(environ, "THANOS_COMPONENT", "") == "sidecar" {
+			if repository.Get(environ, "THANOS_COMPONENT", "") == "sidecar" {
 				args = append(args, "--prometheus.url=http://localhost:9090")
 			}
 			return args, nil

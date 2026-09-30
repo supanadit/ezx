@@ -28,7 +28,7 @@ func TestParallelNodeCallbacksAreSerialized(t *testing.T) {
 	factory := func(node domain.ProcessNode) process.ProcessRepository {
 		return system.NewProcessRepository(node, nil)
 	}
-	orch := orchestrator.NewService(factory, log, nil)
+	orch := orchestrator.NewService(factory, log, nil, testOrchestratorDeps())
 
 	reg := runtime.NewRegistry()
 	reg.Register("ezx", func(b runtime.Binder) any {

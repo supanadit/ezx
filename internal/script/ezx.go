@@ -21,6 +21,12 @@ type Deps struct {
 	Log logger.Logger
 	// Proc spawns per-node process handles for ezx.process.
 	Proc ProcessFactory
+	// Execer replaces the process image for ezx.process.exec.
+	Execer ProcessExecer
+	// Editors opens file editors for ezx.editor.
+	Editors EditorOpener
+	// Probes runs readiness/health checks for ezx.probe.
+	Probes ProbeChecker
 	// Chain runs declarative process trees for ezx.chain (may be nil).
 	Chain ChainRunner
 	// Ready flips the readiness state surfaced by /readyz (may be nil).
@@ -65,8 +71,8 @@ type EzxModule struct {
 func NewEzxModule(d Deps) *EzxModule {
 	return &EzxModule{
 		Env:       NewEnvModule(),
-		Editor:    NewEditorModule(),
-		Process:   NewProcessModule(d.Ctx, d.Proc, d.Callbacks, d.Gate),
+		Editor:    NewEditorModule(d.Editors),
+		Process:   NewProcessModule(d.Ctx, d.Proc, d.Execer, d.Callbacks, d.Gate),
 		Log:       NewLogModule(d.Log),
 		Chain:     NewChainModule(d.Ctx, d.Chain, d.Gate),
 		FS:        NewFSModule(),
@@ -74,7 +80,7 @@ func NewEzxModule(d Deps) *EzxModule {
 		Crypto:    NewCryptoModule(),
 		Archive:   NewArchiveModule(),
 		Health:    NewHealthModule(d.Ready),
-		Probe:     NewProbeModule(d.Ctx),
+		Probe:     NewProbeModule(d.Ctx, d.Probes),
 		Scheduler: NewSchedulerModule(d.Sched, d.Callbacks),
 		API:       NewApiModule(d.Routes, d.Callbacks),
 		YAML:      NewYamlModule(),

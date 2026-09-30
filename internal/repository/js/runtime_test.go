@@ -27,11 +27,15 @@ import (
 // registerTestHostModule wires the aggregate ezx host module into reg using
 // the new Deps API; b.Invoker() provides callback support to ezx.api.
 func registerTestHostModule(reg *runtime.Registry, ctx context.Context, log logger.Logger, factory script.ProcessFactory, orch *orchestrator.Service, router *echo.Echo) {
+	adapter := system.NewAdapter()
 	reg.Register("ezx", func(b runtime.Binder) any {
 		return script.NewEzxModule(script.Deps{
 			Ctx:       ctx,
 			Log:       log,
 			Proc:      factory,
+			Execer:    adapter,
+			Editors:   adapter,
+			Probes:    adapter,
 			Chain:     orch,
 			Sched:     orch,
 			Routes:    router,
@@ -246,7 +250,7 @@ func TestScriptEndToEndManualTrigger(t *testing.T) {
 	factory := func(node domain.ProcessNode) process.ProcessRepository {
 		return &e2eFakeProc{name: node.Name, startC: startC, done: make(chan struct{})}
 	}
-	orch := orchestrator.NewService(factory, log, nil)
+	orch := orchestrator.NewService(factory, log, nil, testOrchestratorDeps())
 
 	reg := runtime.NewRegistry()
 	registerTestHostModule(reg, ctx, log, factory, orch, router)
@@ -417,7 +421,7 @@ func TestScriptSchedulerEvery(t *testing.T) {
 	factory := func(node domain.ProcessNode) process.ProcessRepository {
 		return &e2eFakeProc{name: node.Name, startC: startC, done: make(chan struct{})}
 	}
-	orch := orchestrator.NewService(factory, log, nil)
+	orch := orchestrator.NewService(factory, log, nil, testOrchestratorDeps())
 
 	reg := runtime.NewRegistry()
 	registerTestHostModule(reg, ctx, log, factory, orch, router)
@@ -485,7 +489,7 @@ func TestScriptLifecycleCallbacks(t *testing.T) {
 	factory := func(node domain.ProcessNode) process.ProcessRepository {
 		return &e2eFakeProc{name: node.Name, startC: make(chan string, 8), done: make(chan struct{})}
 	}
-	orch := orchestrator.NewService(factory, log, nil)
+	orch := orchestrator.NewService(factory, log, nil, testOrchestratorDeps())
 
 	reg := runtime.NewRegistry()
 	registerTestHostModule(reg, ctx, log, factory, orch, router)
@@ -536,7 +540,7 @@ func TestScriptReadinessFunc(t *testing.T) {
 	factory := func(node domain.ProcessNode) process.ProcessRepository {
 		return &e2eFakeProc{name: node.Name, startC: startC, done: make(chan struct{})}
 	}
-	orch := orchestrator.NewService(factory, log, nil)
+	orch := orchestrator.NewService(factory, log, nil, testOrchestratorDeps())
 
 	reg := runtime.NewRegistry()
 	registerTestHostModule(reg, ctx, log, factory, orch, router)

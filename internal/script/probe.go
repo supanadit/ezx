@@ -7,21 +7,29 @@ import (
 	"github.com/supanadit/ezx/internal/repository"
 )
 
+// ProbeChecker is the local driven-side Port for the probe engine (R10): the
+// delivery layer declares what it needs and never imports the concrete probe
+// adapter.
+type ProbeChecker interface {
+	Check(ctx context.Context, p domain.Probe) (bool, error)
+}
+
 // ProbeModule exposes ezx.probe: generic health-check primitives backed by the
 // Go probe engine. Scripts compose these for comprehensive container readiness
 // checks (TCP/HTTP/exec connectivity, disk space, process presence, zombies).
 type ProbeModule struct {
-	ctx context.Context
+	ctx    context.Context
+	probes ProbeChecker
 }
 
-// NewProbeModule returns a ProbeModule using the given context.
-func NewProbeModule(ctx context.Context) *ProbeModule {
-	return &ProbeModule{ctx: ctx}
+// NewProbeModule returns a ProbeModule using the given context and probe port.
+func NewProbeModule(ctx context.Context, probes ProbeChecker) *ProbeModule {
+	return &ProbeModule{ctx: ctx, probes: probes}
 }
 
 // TCP reports whether a TCP connection to host:port succeeds.
 func (m *ProbeModule) TCP(host string, port int) bool {
-	ok, _ := repository.Check(m.ctx, domain.Probe{
+	ok, _ := m.probes.Check(m.ctx, domain.Probe{
 		Type: domain.ProbeTypeTCP,
 		TCP:  domain.TCPProbe{Host: host, Port: port},
 	})
@@ -31,7 +39,7 @@ func (m *ProbeModule) TCP(host string, port int) bool {
 // HTTP reports whether an HTTP GET to url returns an acceptable status.
 // expectStatus, when non-zero, is the required status; zero accepts any 2xx.
 func (m *ProbeModule) HTTP(url string, expectStatus int) bool {
-	ok, _ := repository.Check(m.ctx, domain.Probe{
+	ok, _ := m.probes.Check(m.ctx, domain.Probe{
 		Type: domain.ProbeTypeHTTP,
 		HTTP: domain.HTTPProbe{URL: url, ExpectStatus: expectStatus},
 	})
@@ -40,7 +48,7 @@ func (m *ProbeModule) HTTP(url string, expectStatus int) bool {
 
 // Exec reports whether the command exits 0.
 func (m *ProbeModule) Exec(cmd ...string) bool {
-	ok, _ := repository.Check(m.ctx, domain.Probe{
+	ok, _ := m.probes.Check(m.ctx, domain.Probe{
 		Type: domain.ProbeTypeExec,
 		Exec: cmd,
 	})

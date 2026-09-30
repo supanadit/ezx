@@ -193,6 +193,7 @@ process: {
     filePath: "/var/log/ezx/pgbouncer.log",
     maxBytes: 5 * 1024 * 1024,      // rotate at 5 MiB (default 10 MiB)
     maxBackups: 2,                  // keep .log + .1 + .2 (default 3)
+    compress: true,                 // gzip each rotated file (.log.1.gz)
     stderr: "stderr",               // stderr still goes to container stderr
   },
 },
@@ -201,8 +202,8 @@ process: {
 - **Rotation** is size-based: when a write would push the active file past
   `maxBytes`, it is closed, shifted to `.1` (newest), older backups shift down,
   and backups beyond `maxBackups` are dropped. `maxBackups < 0` keeps backups
-  indefinitely. Rotation is size-based only; there is no time-based rotation or
-  compression.
+  indefinitely. Rotation is size-based only; there is no time-based rotation.
+  Set `compress: true` to gzip each archive (`app.log.1.gz`).
 - **Append on open** — a restarted node appends to the current file; rotation is
   purely size-driven.
 - **Shared path** — when both `stdout` and `stderr` are `"file"` with the same
@@ -212,6 +213,58 @@ process: {
   (fail-fast at chain validation, naming the node).
 
 Try it: `./ezx bootstrap examples/bootstrap/log-rotation.js`.
+
+### Rotating logs the process writes itself
+
+`log.stdout`/`log.filePath` covers the case where **ezx owns the stream**. The
+other common case is a server that opens and writes its own log files (Traefik,
+Apache httpd, Nginx). ezx does not own those descriptors, so `maxBytes` cannot
+apply to them — and a plain rename is not enough, because the server keeps
+writing to the old inode until it is told to reopen. Add a node-level
+`logRotate` block, which is size-driven and performs the reopen handshake for
+you:
+
+```js
+logRotate: {
+  signal: "USR1",              // reopen after rename (Apache/Nginx/Traefik)
+  maxBackups: 7,               // keep file.1 … file.7
+  compress: true,              // gzip each archive (file.1.gz)
+  files: [
+    { include: "/var/log/apache2/*.log", maxBytes: 1 * 1024 * 1024 * 1024 },
+    { include: "/var/log/apache2/error.log", maxBytes: 100 * 1024 * 1024, maxBackups: 14 },
+  ],
+  exclude: ["*.gz", "*.1"],    // never rotate our own archives
+  oversized: { maxBytes: 5 * 1024 * 1024 * 1024, keepTailBytes: 200 * 1024 * 1024, compress: true },
+},
+```
+
+- **Size-driven, no schedule.** ezx watches the include directories (so new
+  files created at runtime are picked up without a restart) and rotates a file
+  when a write pushes it past `maxBytes`. There is no cron and no periodic
+  process spawn.
+- **Reopen handshake.** A pass renames every crossed file, sends `signal`
+  **once per distinct signal** to the node's supervised process, and only then
+  compresses and prunes — so new bytes cannot land in the archive. If the
+  reopen target cannot be resolved the whole pass is skipped, so a file is never
+  renamed without the signal (`onMissingPid: "skip"` by default).
+- **Multi-file by design.** Several logs belonging to one process rotate
+  together with a single signal. A single file is the shorthand
+  `logRotate: { filePath: "/path/app.log", signal: "USR1" }`.
+- **Per-file overrides.** `maxBytes`, `maxBackups`, and `signal` may differ per
+  `files[]` entry; `compress` is group-wide.
+- **`reopen: "copytruncate"`** is the documented-lossy fallback for processes
+  that cannot reopen (lines written between the copy and the truncate are lost).
+- **Oversized legacy files.** `oversized` also rotates an already-huge file on
+  the first pass and keeps only its tail, without ever reading the head — a
+  90 GB sparse file is handled in bounded time.
+- **`interval`** (off by default) adds a low-frequency poll for filesystems
+  where change events are unreliable, e.g. a network mount written from another
+  host.
+- **Validation** — `filePath` XOR `files`; `reopen: "signal"` needs a signal;
+  and `logRotate` is rejected on `exec`, `oneshot`, and `scheduler` nodes, which
+  have no long-running supervised process to reopen.
+
+Try it: `./ezx bootstrap examples/bootstrap/log-rotation-app.js`.
 
 ## The `require("ezx")` host API
 
@@ -277,6 +330,9 @@ EZX_HEALTH_ADDR=:8080 \
 
 # Per-service file-backed logging with size-based rotation
 ./ezx bootstrap examples/bootstrap/log-rotation.js
+
+# Rotate log files the process opens itself (reopen signal handshake)
+./ezx bootstrap examples/bootstrap/log-rotation-app.js
 
 # Port of the official PostgreSQL docker-entrypoint.sh
 ./ezx bootstrap examples/bootstrap/postgres.js

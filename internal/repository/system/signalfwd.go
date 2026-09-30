@@ -1,55 +1,25 @@
-package repository
+package system
 
 import (
 	"context"
 	"os"
 	"os/signal"
 	"sync"
-	"syscall"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository"
 )
-
-// ForwardSignalSet is the default set of signals relayed to a child process
-// group when a node opts into full forwarding. It mirrors what dumb-init/tini
-// forward so that PID 1 semantics reach the supervised process.
-var ForwardSignalSet = []os.Signal{
-	syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP,
-	syscall.SIGQUIT, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGWINCH,
-}
-
-// SignalName parses a signal name like "SIGUSR1", "USR1", or "10" to a signal.
-func SignalName(name string) (os.Signal, bool) {
-	switch name {
-	case "SIGTERM", "TERM", "15":
-		return syscall.SIGTERM, true
-	case "SIGINT", "INT", "2":
-		return syscall.SIGINT, true
-	case "SIGHUP", "HUP", "1":
-		return syscall.SIGHUP, true
-	case "SIGQUIT", "QUIT", "3":
-		return syscall.SIGQUIT, true
-	case "SIGUSR1", "USR1", "10":
-		return syscall.SIGUSR1, true
-	case "SIGUSR2", "USR2", "12":
-		return syscall.SIGUSR2, true
-	case "SIGWINCH", "WINCH", "28":
-		return syscall.SIGWINCH, true
-	default:
-		return nil, false
-	}
-}
 
 // ResolveForwardSignals converts node signal names into a deduplicated set.
 // An empty input returns the default set.
 func ResolveForwardSignals(names []string) ([]os.Signal, error) {
 	if len(names) == 0 {
-		return ForwardSignalSet, nil
+		return repository.ForwardSignalSet, nil
 	}
 	seen := map[os.Signal]bool{}
 	var out []os.Signal
 	for _, n := range names {
-		sig, ok := SignalName(n)
+		sig, ok := repository.SignalName(n)
 		if !ok {
 			return nil, domain.SignalForwardError{Name: n}
 		}

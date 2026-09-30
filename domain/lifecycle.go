@@ -129,6 +129,9 @@ type LogConfig struct {
 	// MaxBackups is how many rotated files (path.1 … path.N) to keep;
 	// <0 = unlimited, 0 = default 3. Applies to file destinations only.
 	MaxBackups int
+	// Compress gzips each rotated file (path.1 → path.1.gz). Applies to file
+	// destinations only.
+	Compress bool
 }
 
 // ShutdownConfig controls graceful shutdown of a ProcessNode.

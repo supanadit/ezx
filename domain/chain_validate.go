@@ -49,6 +49,9 @@ func ValidateChain(chain ProcessChain) error {
 				return fmt.Errorf("node %q: log destination %q requires filePath", n.Name, LogDestFile)
 			}
 		}
+		if err := validateLogRotate(n); err != nil {
+			return err
+		}
 	}
 
 	// Oneshot restrictions: a oneshot runs to completion, so it cannot combine
@@ -164,6 +167,75 @@ func ValidateChain(chain ProcessChain) error {
 			if err := dfs(i); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// validateLogRotate checks a node's LogRotate config: mutual exclusivity of the
+// single-file shorthand and the pattern list, reopen-mechanism requirements, the
+// unknown-enum cases, and the oversized escape hatch. Rotation requires a
+// long-running supervised process to reopen, so Exec, Oneshot, and Scheduler
+// nodes are rejected.
+func validateLogRotate(n *ProcessNode) error {
+	cfg := n.LogRotate
+	if cfg == nil {
+		return nil
+	}
+	if n.Exec {
+		return fmt.Errorf("node %q: logRotate cannot combine with Exec (ezx gives up supervision and cannot signal the app to reopen)", n.Name)
+	}
+	if n.Oneshot {
+		return fmt.Errorf("node %q: logRotate cannot combine with Oneshot (no long-running process to reopen)", n.Name)
+	}
+	if n.Scheduler != nil {
+		return fmt.Errorf("node %q: logRotate cannot combine with Scheduler (each tick is a separate process)", n.Name)
+	}
+	if cfg.FilePath != "" && len(cfg.Files) > 0 {
+		return fmt.Errorf("node %q: logRotate sets both filePath and files; use one or the other", n.Name)
+	}
+	if cfg.FilePath == "" && len(cfg.Files) == 0 {
+		return fmt.Errorf("node %q: logRotate requires filePath or files", n.Name)
+	}
+	for i, f := range cfg.Files {
+		if f.Include == "" {
+			return fmt.Errorf("node %q: logRotate files[%d] has an empty include pattern", n.Name, i)
+		}
+	}
+	switch cfg.ReopenModeOrDefault() {
+	case ReopenSignal, ReopenCopyTruncate:
+	default:
+		return fmt.Errorf("node %q: logRotate has unknown reopen %q (want %q or %q)", n.Name, cfg.Reopen, ReopenSignal, ReopenCopyTruncate)
+	}
+	switch cfg.OnMissingPidOrDefault() {
+	case OnMissingPidSkip, OnMissingPidFail:
+	default:
+		return fmt.Errorf("node %q: logRotate has unknown onMissingPid %q (want %q or %q)", n.Name, cfg.OnMissingPid, OnMissingPidSkip, OnMissingPidFail)
+	}
+	if cfg.Interval < 0 {
+		return fmt.Errorf("node %q: logRotate interval must not be negative", n.Name)
+	}
+	if cfg.ReopenModeOrDefault() == ReopenSignal && cfg.Signal == "" {
+		// A group signal is optional only when every file carries its own;
+		// the single-file shorthand has no per-file slot, so it must set it.
+		if len(cfg.Files) == 0 {
+			return fmt.Errorf("node %q: logRotate reopen %q requires a signal", n.Name, ReopenSignal)
+		}
+		for i, f := range cfg.Files {
+			if f.Signal == "" {
+				return fmt.Errorf("node %q: logRotate reopen %q requires a signal (group value or files[%d].signal)", n.Name, ReopenSignal, i)
+			}
+		}
+	}
+	if o := cfg.Oversized; o != nil {
+		if o.MaxBytes <= 0 {
+			return fmt.Errorf("node %q: logRotate oversized.maxBytes must be positive", n.Name)
+		}
+		if o.KeepTailBytes <= 0 {
+			return fmt.Errorf("node %q: logRotate oversized.keepTailBytes must be positive", n.Name)
+		}
+		if o.KeepTailBytes >= o.MaxBytes {
+			return fmt.Errorf("node %q: logRotate oversized.keepTailBytes (%d) must be less than oversized.maxBytes (%d)", n.Name, o.KeepTailBytes, o.MaxBytes)
 		}
 	}
 	return nil

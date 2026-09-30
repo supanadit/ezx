@@ -1,17 +1,18 @@
 //go:build !linux
 
-package repository
+package system
 
 import (
 	"fmt"
 	"os/exec"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository"
 )
 
 // BuildProcessEnv is platform-agnostic; the driver reuses it.
 func BuildProcessEnv(parentEnv []string, p domain.Process) ([]string, error) {
-	base, err := Filter(parentEnv, p.FilterEnv, p.FilterEnvPattern)
+	base, err := repository.Filter(parentEnv, p.FilterEnv, p.FilterEnvPattern)
 	if err != nil {
 		return nil, err
 	}

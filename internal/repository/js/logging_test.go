@@ -30,7 +30,7 @@ func runRealChainBinding(t *testing.T, src string) error {
 	factory := func(node domain.ProcessNode) process.ProcessRepository {
 		return system.NewProcessRepository(node, nil)
 	}
-	orch := orchestrator.NewService(factory, log, nil)
+	orch := orchestrator.NewService(factory, log, nil, testOrchestratorDeps())
 
 	reg := runtime.NewRegistry()
 	registerTestHostModule(reg, ctx, log, factory, orch, router)

@@ -1,6 +1,8 @@
 package system
 
 import (
+	"compress/gzip"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,7 +33,7 @@ func readFile(t *testing.T, path string) string {
 func TestRotatingWriterCreatesFileAndParentDirs(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "deep", "app.log")
-	w, err := newRotatingFileWriter(path, 100, 3)
+	w, err := newRotatingFileWriter(path, 100, 3, false)
 	if err != nil {
 		t.Fatalf("newRotatingFileWriter: %v", err)
 	}
@@ -48,7 +50,7 @@ func TestRotatingWriterCreatesFileAndParentDirs(t *testing.T) {
 func TestRotatingWriterRotationTriggersAtMaxBytes(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
-	w, err := newRotatingFileWriter(path, 100, 3)
+	w, err := newRotatingFileWriter(path, 100, 3, false)
 	if err != nil {
 		t.Fatalf("newRotatingFileWriter: %v", err)
 	}
@@ -72,7 +74,7 @@ func TestRotatingWriterRotationTriggersAtMaxBytes(t *testing.T) {
 func TestRotatingWriterBackupShiftOrder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
-	w, err := newRotatingFileWriter(path, 10, 3)
+	w, err := newRotatingFileWriter(path, 10, 3, false)
 	if err != nil {
 		t.Fatalf("newRotatingFileWriter: %v", err)
 	}
@@ -103,7 +105,7 @@ func TestRotatingWriterBackupShiftOrder(t *testing.T) {
 func TestRotatingWriterDropsBackupsBeyondMax(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
-	w, err := newRotatingFileWriter(path, 10, 2)
+	w, err := newRotatingFileWriter(path, 10, 2, false)
 	if err != nil {
 		t.Fatalf("newRotatingFileWriter: %v", err)
 	}
@@ -132,7 +134,7 @@ func TestRotatingWriterDropsBackupsBeyondMax(t *testing.T) {
 func TestRotatingWriterUnlimitedBackups(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
-	w, err := newRotatingFileWriter(path, 10, -1)
+	w, err := newRotatingFileWriter(path, 10, -1, false)
 	if err != nil {
 		t.Fatalf("newRotatingFileWriter: %v", err)
 	}
@@ -160,7 +162,7 @@ func TestRotatingWriterUnlimitedBackups(t *testing.T) {
 func TestRotatingWriterAppendOnReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
-	w, err := newRotatingFileWriter(path, 10, 3)
+	w, err := newRotatingFileWriter(path, 10, 3, false)
 	if err != nil {
 		t.Fatalf("newRotatingFileWriter: %v", err)
 	}
@@ -171,7 +173,7 @@ func TestRotatingWriterAppendOnReopen(t *testing.T) {
 	writeAll(t, w, "2222222222") // rotate → .2=0000, .1=1111, active=2222
 
 	// Reopen a fresh writer in append mode (simulates a restart).
-	w2, err := newRotatingFileWriter(path, 10, 3)
+	w2, err := newRotatingFileWriter(path, 10, 3, false)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -193,7 +195,7 @@ func TestRotatingWriterAppendOnReopen(t *testing.T) {
 func TestRotatingWriterLargeSingleWriteDoesNotSplit(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
-	w, err := newRotatingFileWriter(path, 10, 3)
+	w, err := newRotatingFileWriter(path, 10, 3, false)
 	if err != nil {
 		t.Fatalf("newRotatingFileWriter: %v", err)
 	}
@@ -212,12 +214,48 @@ func TestRotatingWriterLargeSingleWriteDoesNotSplit(t *testing.T) {
 	}
 }
 
+// TestRotatingWriterCompressesBackups verifies compression produces path.1.gz
+// and removes the uncompressed archive.
+func TestRotatingWriterCompressesBackups(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	w, err := newRotatingFileWriter(path, 10, 3, true)
+	if err != nil {
+		t.Fatalf("newRotatingFileWriter: %v", err)
+	}
+	defer w.Close()
+
+	writeAll(t, w, "0000000000")
+	writeAll(t, w, "1111111111") // rotate → .1.gz = 0000000000
+
+	if _, err := os.Stat(path + ".1"); !os.IsNotExist(err) {
+		t.Fatalf("uncompressed .1 should not exist, stat err = %v", err)
+	}
+	gz := path + ".1.gz"
+	f, err := os.Open(gz)
+	if err != nil {
+		t.Fatalf("open %q: %v", gz, err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip reader %q: %v", gz, err)
+	}
+	got, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read gzip %q: %v", gz, err)
+	}
+	if string(got) != "0000000000" {
+		t.Fatalf("decompressed = %q, want 0000000000", got)
+	}
+}
+
 // TestRotatingWriterConcurrentWriteClose verifies Write and Close can race
 // without deadlock or panic (run with -race).
 func TestRotatingWriterConcurrentWriteClose(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
-	w, err := newRotatingFileWriter(path, 10, 3)
+	w, err := newRotatingFileWriter(path, 10, 3, false)
 	if err != nil {
 		t.Fatalf("newRotatingFileWriter: %v", err)
 	}

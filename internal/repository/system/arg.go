@@ -1,4 +1,4 @@
-package repository
+package system
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository"
 )
 
 // BuildArgs assembles the CLI arguments for a spawned process from the environment:
@@ -40,7 +41,7 @@ func BuildArgs(p domain.Process, environ []string) ([]string, error) {
 // interpolation.
 func lookupFrom(environ []string) func(string) (string, bool) {
 	return func(name string) (string, bool) {
-		return Lookup(environ, name)
+		return repository.Lookup(environ, name)
 	}
 }
 
@@ -61,7 +62,7 @@ func executeArgOperation(op domain.ArgOperation, environ []string) ([]string, er
 
 	// Pattern-enum: repeat once per env var match, transforming the captured name.
 	if op.FromEnvPattern != "" {
-		matches, err := Enumerate(environ, op.FromEnvPattern)
+		matches, err := repository.Enumerate(environ, op.FromEnvPattern)
 		if err != nil {
 			return nil, fmt.Errorf("invalid FromEnvPattern %q: %w", op.FromEnvPattern, err)
 		}
@@ -82,9 +83,9 @@ func executeArgOperation(op domain.ArgOperation, environ []string) ([]string, er
 
 	// FromEnv: a single env var drives the value (and may gate a bare-flag toggle).
 	if op.FromEnv != "" {
-		value, ok := Lookup(environ, op.FromEnv)
+		value, ok := repository.Lookup(environ, op.FromEnv)
 		if op.Format == domain.ArgFormatBareFlag {
-			if ok && IsTruthyValue(value) {
+			if ok && repository.IsTruthyValue(value) {
 				return []string{op.Flag}, nil
 			}
 			return nil, nil

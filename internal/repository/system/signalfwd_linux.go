@@ -1,6 +1,6 @@
 //go:build linux
 
-package repository
+package system
 
 import (
 	"os"

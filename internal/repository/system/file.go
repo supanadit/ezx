@@ -1,4 +1,4 @@
-package repository
+package system
 
 import (
 	"bytes"
@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository"
 )
 
 // envSource represents a resolved value source for an operation execution.
@@ -115,7 +116,7 @@ func applyPermissionAndOwner(target string, permission os.FileMode, owner string
 		}
 	}
 	if owner != "" {
-		if err := chown(target, owner); err != nil {
+		if err := repository.Chown(target, owner); err != nil {
 			return err
 		}
 	}
@@ -146,7 +147,7 @@ func applyOperation(op domain.FileOperation, target string, permission os.FileMo
 				}
 			}
 			if owner != "" {
-				if err := chown(opTarget, owner); err != nil {
+				if err := repository.Chown(opTarget, owner); err != nil {
 					return err
 				}
 			}
@@ -164,7 +165,7 @@ func applyOperation(op domain.FileOperation, target string, permission os.FileMo
 func resolveSources(op domain.FileOperation) ([]envSource, error) {
 	switch {
 	case op.FromEnvPattern != "":
-		matches, err := Enumerate(os.Environ(), op.FromEnvPattern)
+		matches, err := repository.Enumerate(os.Environ(), op.FromEnvPattern)
 		if err != nil {
 			return nil, fmt.Errorf("invalid FromEnvPattern %q: %w", op.FromEnvPattern, err)
 		}
@@ -373,9 +374,9 @@ func envConditionMet(c domain.EnvCondition, environ []string) bool {
 		return true
 	}
 	if c.Value == "" {
-		return IsSet(environ, c.Name)
+		return repository.IsSet(environ, c.Name)
 	}
-	return HasValue(environ, c.Name, c.Value)
+	return repository.HasValue(environ, c.Name, c.Value)
 }
 
 // ensureParentDir creates the parent directory of path if it does not exist.
@@ -713,80 +714,6 @@ func opCopy(op domain.FileOperation, target string, src envSource) error {
 	return os.WriteFile(target, buf.Bytes(), 0o644)
 }
 
-// chown changes file ownership from "user:group" or "user".
-func chown(path, owner string) error {
-	user, group, _ := strings.Cut(owner, ":")
-	uid, err := lookupUID(user)
-	if err != nil {
-		return err
-	}
-	gid := -1
-	if group != "" {
-		gid, err = lookupGID(group)
-		if err != nil {
-			return err
-		}
-	}
-	return os.Chown(path, uid, gid)
-}
-
-// lookupUID resolves a user name (or numeric UID) to a UID by parsing /etc/passwd.
-func lookupUID(name string) (int, error) {
-	if name == "" {
-		return -1, nil
-	}
-	if uid, err := strconv.Atoi(name); err == nil {
-		return uid, nil
-	}
-	uid, err := lookupIDFromFile("/etc/passwd", name, 0, 2)
-	if err != nil {
-		return -1, fmt.Errorf("unknown user %q: %w", name, err)
-	}
-	return uid, nil
-}
-
-// lookupGID resolves a group name (or numeric GID) to a GID by parsing /etc/group.
-func lookupGID(name string) (int, error) {
-	if name == "" {
-		return -1, nil
-	}
-	if gid, err := strconv.Atoi(name); err == nil {
-		return gid, nil
-	}
-	gid, err := lookupIDFromFile("/etc/group", name, 0, 2)
-	if err != nil {
-		return -1, fmt.Errorf("unknown group %q: %w", name, err)
-	}
-	return gid, nil
-}
-
-// lookupIDFromFile finds the numeric ID of a named entry in a colon-separated table
-// (e.g., /etc/passwd, /etc/group). nameField is the field index for the name and
-// idField the field index for the numeric ID.
-func lookupIDFromFile(path, name string, nameField, idField int) (int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return -1, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Split(line, ":")
-		if len(fields) <= idField {
-			continue
-		}
-		if fields[nameField] != name {
-			continue
-		}
-		id, err := strconv.Atoi(fields[idField])
-		if err != nil {
-			return -1, err
-		}
-		return id, nil
-	}
-	return -1, os.ErrNotExist
-}
 
 // fileEditor implements domain.FileEditor by delegating to the same operations
 // used by the declarative Operations path. It wraps a target file path.

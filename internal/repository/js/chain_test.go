@@ -30,7 +30,7 @@ func runChainBinding(t *testing.T, src string) (order []string, runErr error) {
 	factory := func(node domain.ProcessNode) process.ProcessRepository {
 		return &e2eFakeProc{name: node.Name, startC: startC, done: make(chan struct{})}
 	}
-	orch := orchestrator.NewService(factory, log, nil)
+	orch := orchestrator.NewService(factory, log, nil, testOrchestratorDeps())
 
 	reg := runtime.NewRegistry()
 	registerTestHostModule(reg, ctx, log, factory, orch, router)
@@ -248,4 +248,11 @@ func TestChainBindingNeedParentReadyLegacy(t *testing.T) {
 	if len(order) != 2 || order[0] != "a" || order[1] != "b" {
 		t.Fatalf("legacy needParentReady order = %v, want [a b]", order)
 	}
+}
+
+// testOrchestratorDeps supplies the supervisor's driven-side ports backed by
+// the real OS adapter for the JS chain tests.
+func testOrchestratorDeps() orchestrator.Deps {
+	a := system.NewAdapter()
+	return orchestrator.Deps{Files: a, Args: a, Exec: a, Probes: a, Signals: a, Cron: a}
 }

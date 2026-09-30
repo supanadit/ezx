@@ -200,6 +200,7 @@ func TestDAGOptionalDepFailureSkipsDependents(t *testing.T) {
 		},
 		&fakeLogger{},
 		nil,
+		testDeps(),
 	)
 
 	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
@@ -393,6 +394,7 @@ func TestDAGMixedEdgeWaitModes(t *testing.T) {
 		},
 		&fakeLogger{},
 		nil,
+		testDeps(),
 	)
 	shutdown := &domain.ShutdownConfig{Signal: syscall.SIGTERM, Timeout: 5 * time.Millisecond, ForceKill: true}
 
@@ -518,6 +520,7 @@ func TestDAGExitEdgeLongRunningNeverExits(t *testing.T) {
 		},
 		&fakeLogger{},
 		nil,
+		testDeps(),
 	)
 
 	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{

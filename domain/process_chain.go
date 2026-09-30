@@ -74,6 +74,13 @@ type ProcessNode struct {
 	// Shutdown controls graceful shutdown of this process (optional; nil means
 	// SIGTERM, 30s timeout, force-kill enabled).
 	Shutdown *ShutdownConfig
+	// LogRotate rotates log files the process writes itself, which ezx cannot
+	// rotate through Process.Log because it does not own their descriptors
+	// (optional; nil means no file rotation). It is size-driven and event-based
+	// (no schedule): the node watches its log directories and rotates on write.
+	// Requires a long-running supervised process, so it is rejected on Exec,
+	// Oneshot, and Scheduler nodes.
+	LogRotate *LogRotateConfig
 	// Exec, when true, replaces the current process image (PID 1) with this
 	// node's process via syscall.Exec — the final, long-running entrypoint
 	// process (e.g. the postgres server) becomes PID 1 for native signal

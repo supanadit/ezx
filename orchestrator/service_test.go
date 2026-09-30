@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository/system"
 	"github.com/supanadit/ezx/logger"
 	"github.com/supanadit/ezx/process"
 )
@@ -87,7 +88,15 @@ func newTestService(procs map[string]*fakeProc) *Service {
 		},
 		&fakeLogger{},
 		nil,
+		testDeps(),
 	)
+}
+
+// testDeps supplies the supervisor's driven-side ports backed by the real OS
+// adapter (the orchestrator tests exercise real provisioning/arg-building).
+func testDeps() Deps {
+	a := system.NewAdapter()
+	return Deps{Files: a, Args: a, Exec: a, Probes: a, Signals: a, Cron: a}
 }
 
 var _ logger.Logger = (*fakeLogger)(nil)
@@ -459,6 +468,7 @@ func TestRunRestartsOnFailure(t *testing.T) {
 		},
 		&fakeLogger{},
 		nil,
+		testDeps(),
 	)
 
 	chain := domain.ProcessChain{
@@ -1075,6 +1085,7 @@ func TestOneshotRestartRetriesThenSucceeds(t *testing.T) {
 		},
 		&fakeLogger{},
 		nil,
+		testDeps(),
 	)
 
 	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{

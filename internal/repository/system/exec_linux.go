@@ -1,6 +1,6 @@
 //go:build linux
 
-package repository
+package system
 
 import (
 	"fmt"
@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/supanadit/ezx/domain"
+	"github.com/supanadit/ezx/internal/repository"
 )
 
 // BuildProcessEnv assembles the environment for a spawned or exec'd process:
@@ -15,7 +16,7 @@ import (
 // with the process's additive Environment entries appended last so they
 // override any inherited or filtered values.
 func BuildProcessEnv(parentEnv []string, p domain.Process) ([]string, error) {
-	base, err := Filter(parentEnv, p.FilterEnv, p.FilterEnvPattern)
+	base, err := repository.Filter(parentEnv, p.FilterEnv, p.FilterEnvPattern)
 	if err != nil {
 		return nil, err
 	}
@@ -61,12 +62,12 @@ func SetProcessGroupLeader(cmd *exec.Cmd) {
 }
 
 func resolveCred(user, group string) (uid, gid int, err error) {
-	uid, err = ResolveUID(user)
+	uid, err = repository.ResolveUID(user)
 	if err != nil {
 		return 0, 0, fmt.Errorf("resolve user %q: %w", user, err)
 	}
 	if group != "" {
-		gid, err = ResolveGID(group)
+		gid, err = repository.ResolveGID(group)
 		if err != nil {
 			return 0, 0, fmt.Errorf("resolve group %q: %w", group, err)
 		}

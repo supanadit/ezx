@@ -267,3 +267,109 @@ func TestValidateChainCycleNamesCycle(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateChainLogRotate covers the logRotate validation rules: shorthand
+// vs pattern list exclusivity, reopen/signal requirements, unknown enums, the
+// oversized escape hatch, and the node-type restrictions.
+func TestValidateChainLogRotate(t *testing.T) {
+	tests := []struct {
+		name    string
+		node    ProcessNode
+		wantErr string
+	}{
+		{
+			name: "single file shorthand with signal",
+			node: ProcessNode{Name: "a", LogRotate: &LogRotateConfig{FilePath: "/var/log/a.log", Signal: "USR1"}},
+		},
+		{
+			name: "files with per-file signals and no group signal",
+			node: ProcessNode{Name: "a", LogRotate: &LogRotateConfig{
+				Files: []LogRotateFile{{Include: "/var/log/*.log", Signal: "USR1"}},
+			}},
+		},
+		{
+			name: "copytruncate needs no signal",
+			node: ProcessNode{Name: "a", LogRotate: &LogRotateConfig{
+				FilePath: "/var/log/a.log",
+				Reopen:   ReopenCopyTruncate,
+			}},
+		},
+		{
+			name: "oversized valid",
+			node: ProcessNode{Name: "a", LogRotate: &LogRotateConfig{
+				FilePath:  "/var/log/a.log",
+				Signal:    "USR1",
+				Oversized: &OversizedConfig{MaxBytes: 100, KeepTailBytes: 10},
+			}},
+		},
+		{
+			name:    "both filePath and files",
+			node:    ProcessNode{Name: "a", LogRotate: &LogRotateConfig{FilePath: "/a.log", Files: []LogRotateFile{{Include: "/b.log"}}, Signal: "USR1"}},
+			wantErr: "both filePath and files",
+		},
+		{
+			name:    "neither filePath nor files",
+			node:    ProcessNode{Name: "a", LogRotate: &LogRotateConfig{Signal: "USR1"}},
+			wantErr: "requires filePath or files",
+		},
+		{
+			name:    "empty include",
+			node:    ProcessNode{Name: "a", LogRotate: &LogRotateConfig{Files: []LogRotateFile{{MaxBytes: 1}}, Signal: "USR1"}},
+			wantErr: "empty include",
+		},
+		{
+			name:    "signal reopen without signal",
+			node:    ProcessNode{Name: "a", LogRotate: &LogRotateConfig{FilePath: "/a.log"}},
+			wantErr: "requires a signal",
+		},
+		{
+			name:    "unknown reopen",
+			node:    ProcessNode{Name: "a", LogRotate: &LogRotateConfig{FilePath: "/a.log", Signal: "USR1", Reopen: "truncate"}},
+			wantErr: "unknown reopen",
+		},
+		{
+			name:    "unknown onMissingPid",
+			node:    ProcessNode{Name: "a", LogRotate: &LogRotateConfig{FilePath: "/a.log", Signal: "USR1", OnMissingPid: "explode"}},
+			wantErr: "unknown onMissingPid",
+		},
+		{
+			name:    "negative interval",
+			node:    ProcessNode{Name: "a", LogRotate: &LogRotateConfig{FilePath: "/a.log", Signal: "USR1", Interval: -1}},
+			wantErr: "interval must not be negative",
+		},
+		{
+			name:    "oversized keepTail >= maxBytes",
+			node:    ProcessNode{Name: "a", LogRotate: &LogRotateConfig{FilePath: "/a.log", Signal: "USR1", Oversized: &OversizedConfig{MaxBytes: 10, KeepTailBytes: 10}}},
+			wantErr: "must be less than",
+		},
+		{
+			name:    "exec node rejected",
+			node:    ProcessNode{Name: "a", Exec: true, LogRotate: &LogRotateConfig{FilePath: "/a.log", Signal: "USR1"}},
+			wantErr: "cannot combine with Exec",
+		},
+		{
+			name:    "oneshot node rejected",
+			node:    ProcessNode{Name: "a", Oneshot: true, LogRotate: &LogRotateConfig{FilePath: "/a.log", Signal: "USR1"}},
+			wantErr: "cannot combine with Oneshot",
+		},
+		{
+			name:    "scheduler node rejected",
+			node:    ProcessNode{Name: "a", Scheduler: &SchedulerConfig{Schedule: CronSchedule{Expression: "* * * * *"}}, LogRotate: &LogRotateConfig{FilePath: "/a.log", Signal: "USR1"}},
+			wantErr: "cannot combine with Scheduler",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateChain(ProcessChain{Nodes: []ProcessNode{tc.node}})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/internal/repository"
 	"github.com/supanadit/ezx/process"
 	"github.com/supanadit/ezx/runtime"
 )
@@ -18,6 +17,13 @@ import (
 // ProcessFactory constructs a ProcessRepository handle for a ProcessNode. It
 // mirrors orchestrator.ProcessFactory so scripts can spawn processes.
 type ProcessFactory func(node domain.ProcessNode) process.ProcessRepository
+
+// ProcessExecer is the local driven-side Port for replacing the current process
+// image (ezx.process.exec), declared here so delivery never imports the OS
+// adapter (R10).
+type ProcessExecer interface {
+	Exec(p domain.Process, env []string) error
+}
 
 // ProcessModule exposes ezx.process: spawn(opts) starts a process from a JS
 // object and returns a handle with wait/signal/kill/pid/done. It carries the
@@ -28,17 +34,19 @@ type ProcessFactory func(node domain.ProcessNode) process.ProcessRepository
 type ProcessModule struct {
 	ctx     context.Context
 	factory ProcessFactory
+	execer  ProcessExecer
 	inv     runtime.Invoker
 	gate    runtime.Gate
 }
 
-// NewProcessModule returns a ProcessModule backed by the given factory,
-// interrupting spawned processes when ctx is cancelled. inv is used to deliver
-// streaming callbacks; it may be nil when the engine cannot call back. gate is
-// the scripting engine's entry gate: run/capture/shell park it while blocked
-// on the child process so its onStdout/onStderr callbacks are admitted safely.
-func NewProcessModule(ctx context.Context, factory ProcessFactory, inv runtime.Invoker, gate runtime.Gate) *ProcessModule {
-	return &ProcessModule{ctx: ctx, factory: factory, inv: inv, gate: gate}
+// NewProcessModule returns a ProcessModule backed by the given factory and exec
+// port, interrupting spawned processes when ctx is cancelled. inv is used to
+// deliver streaming callbacks; it may be nil when the engine cannot call back.
+// gate is the scripting engine's entry gate: run/capture/shell park it while
+// blocked on the child process so its onStdout/onStderr callbacks are admitted
+// safely.
+func NewProcessModule(ctx context.Context, factory ProcessFactory, execer ProcessExecer, inv runtime.Invoker, gate runtime.Gate) *ProcessModule {
+	return &ProcessModule{ctx: ctx, factory: factory, execer: execer, inv: inv, gate: gate}
 }
 
 // Spawn launches a process from a JS options object (binary, args, env,
@@ -61,7 +69,7 @@ type ProcessHandle struct {
 // syscall.Exec. This is the final, long-running entrypoint process (e.g. the
 // postgres server). It never returns on success.
 func (m *ProcessModule) Exec(node domain.ProcessNode) error {
-	return repository.Exec(node.Process, os.Environ())
+	return m.execer.Exec(node.Process, os.Environ())
 }
 
 // Start launches the process (idempotent) and begins watching the module's

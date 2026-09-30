@@ -161,7 +161,7 @@ func assertMethods(t *testing.T, label string, typ reflect.Type, want []string) 
 // field here is additive and non-breaking; removing/renaming one fails this
 // test until the list is updated.
 var logConfigFields = []string{
-	"stdout", "stderr", "filePath", "maxBytes", "maxBackups",
+	"stdout", "stderr", "filePath", "maxBytes", "maxBackups", "compress",
 }
 
 // TestLogConfigFieldSurface locks down the script-visible `log` object fields
@@ -210,7 +210,7 @@ var processNodeFields = []string{
 	"name", "optional", "process", "files", "needParentReady", "readiness",
 	"readinessFunc", "restart", "shutdown", "exec", "oneshot", "scheduler",
 	"forwardSignals", "health", "onStart", "onReady", "onExit", "children",
-	"dependsOn", "dependsOnEdges",
+	"dependsOn", "dependsOnEdges", "logRotate",
 }
 
 // TestProcessNodeFieldSurface locks down the script-visible process-node fields

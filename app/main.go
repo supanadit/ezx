@@ -17,6 +17,7 @@ import (
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/health"
 	jsengine "github.com/supanadit/ezx/internal/repository/js"
+	"github.com/supanadit/ezx/internal/repository/logrotate"
 	"github.com/supanadit/ezx/internal/repository/system"
 	"github.com/supanadit/ezx/internal/rest"
 	"github.com/supanadit/ezx/internal/script"
@@ -24,6 +25,7 @@ import (
 	"github.com/supanadit/ezx/logger"
 	"github.com/supanadit/ezx/orchestrator"
 	"github.com/supanadit/ezx/process"
+	"github.com/supanadit/ezx/rotator"
 	"github.com/supanadit/ezx/runtime"
 )
 
@@ -57,11 +59,14 @@ func main() {
 		fx.Provide(func() context.Context { return ctx }),
 		fx.Provide(
 			fx.Annotate(system.NewLogger, fx.As(new(logger.Logger))),
+			system.NewAdapter,
 			func() *system.Reaper { return reaper },
 			func() *echo.Echo { return echo.New() },
-			fx.Annotate(health.NewService, fx.As(new(domain.HealthService))),
+			fx.Annotate(health.NewService, fx.As(new(domain.HealthService)), fx.As(new(rest.HealthService))),
 			provideProcessFactory,
 			provideScriptFactory,
+			provideRotatorFactory,
+			provideOrchestratorDeps,
 			orchestrator.NewService,
 			runtime.NewRegistry,
 			// Scripting-language adapter: swap jsengine for a lua engine (and
@@ -71,6 +76,7 @@ func main() {
 		),
 		fx.Invoke(
 			registerHostModules,
+			wireLogRotator,
 			terminal.NewBootstrapHandler,
 			rest.NewHealthHandler,
 			// Start the health server BEFORE running the root command: the
@@ -185,6 +191,33 @@ func provideScriptFactory(reaper *system.Reaper) script.ProcessFactory {
 	}
 }
 
+// provideRotatorFactory provides the per-node app-owned log rotator used by the
+// orchestrator for nodes that set logRotate.
+func provideRotatorFactory(log logger.Logger) rotator.Factory {
+	return func() rotator.Rotator { return logrotate.New(log) }
+}
+
+// provideOrchestratorDeps satisfies the supervisor's driven-side ports with the
+// single OS adapter. Every port is the same concrete adapter, wired here (the
+// composition root) as the only place that knows the concrete type.
+func provideOrchestratorDeps(a *system.Adapter) orchestrator.Deps {
+	return orchestrator.Deps{
+		Files:   a,
+		Args:    a,
+		Exec:    a,
+		Probes:  a,
+		Signals: a,
+		Cron:    a,
+	}
+}
+
+// wireLogRotator installs the rotation factory on the supervisor. It is a
+// setter (not a constructor parameter) so existing construction sites are
+// unaffected when a node does not use logRotate.
+func wireLogRotator(s *orchestrator.Service, f rotator.Factory) {
+	s.SetRotator(f)
+}
+
 // registerHostModules wires the aggregate ezx host module into the script
 // registry. It is pure composition: delivery types + module Ports only.
 func registerHostModules(
@@ -193,6 +226,7 @@ func registerHostModules(
 	factory script.ProcessFactory,
 	orch *orchestrator.Service,
 	ready domain.HealthService,
+	adapter *system.Adapter,
 	e *echo.Echo,
 	reg *runtime.Registry,
 ) {
@@ -201,6 +235,9 @@ func registerHostModules(
 			Ctx:       ctx,
 			Log:       log,
 			Proc:      factory,
+			Execer:    adapter,
+			Editors:   adapter,
+			Probes:    adapter,
 			Chain:     orch,
 			Ready:     ready,
 			Sched:     orch,

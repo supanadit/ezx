@@ -1,6 +1,6 @@
 //go:build linux
 
-package repository
+package system
 
 import (
 	"os/exec"
@@ -20,7 +20,7 @@ func TestBuildProcessEnv_FilterAndAppend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildProcessEnv: %v", err)
 	}
-	// Filter removes only DROP; the additive OVERRIDE=new is appended after
+	// repository.Filter removes only DROP; the additive OVERRIDE=new is appended after
 	// the inherited OVERRIDE=old (later entries win in exec semantics).
 	want := []string{"KEEP=1", "OVERRIDE=old", "OVERRIDE=new", "ADDED=3"}
 	if len(got) != len(want) {

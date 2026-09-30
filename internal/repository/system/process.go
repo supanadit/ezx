@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/internal/repository"
 )
 
 // maxCaptureBytes caps how much output a single stream buffers when routed to
@@ -81,7 +80,7 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 		return nil
 	}
 
-	procEnv, err := repository.BuildProcessEnv(env, s.node.Process)
+	procEnv, err := BuildProcessEnv(env, s.node.Process)
 	if err != nil {
 		return err
 	}
@@ -110,10 +109,10 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 		cmd.Env = procEnv
 	}
 	cmd.Dir = s.node.Process.WorkingDir
-	if err := repository.ApplyCredential(cmd, s.node.Process); err != nil {
+	if err := ApplyCredential(cmd, s.node.Process); err != nil {
 		return err
 	}
-	repository.SetProcessGroupLeader(cmd)
+	SetProcessGroupLeader(cmd)
 
 	// A file-backed destination requires a target path (defensive check; the
 	// chain validator already fails fast on this).
@@ -129,7 +128,7 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	case domain.LogDestStderr:
 		cmd.Stdout = os.Stderr
 	case domain.LogDestFile:
-		w, err := s.resolveFileWriter(lc.FilePath, lc.MaxBytes, lc.MaxBackups)
+		w, err := s.resolveFileWriter(lc.FilePath, lc.MaxBytes, lc.MaxBackups, lc.Compress)
 		if err != nil {
 			s.closeFileWriters()
 			return err
@@ -144,7 +143,7 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 	case domain.LogDestCapture:
 		cmd.Stderr = &cappedWriter{buf: &s.stderrBuf}
 	case domain.LogDestFile:
-		w, err := s.resolveFileWriter(lc.FilePath, lc.MaxBytes, lc.MaxBackups)
+		w, err := s.resolveFileWriter(lc.FilePath, lc.MaxBytes, lc.MaxBackups, lc.Compress)
 		if err != nil {
 			s.closeFileWriters()
 			return err
@@ -243,7 +242,7 @@ func (s *ProcessRepository) Output() (stdout, stderr string) {
 
 // resolveFileWriter returns the shared rotating writer for path, creating it on
 // first use. stdout+stderr routing to the same path share one writer (D7).
-func (s *ProcessRepository) resolveFileWriter(path string, maxBytes int64, maxBackups int) (io.WriteCloser, error) {
+func (s *ProcessRepository) resolveFileWriter(path string, maxBytes int64, maxBackups int, compress bool) (io.WriteCloser, error) {
 	s.fileMu.Lock()
 	defer s.fileMu.Unlock()
 	if s.fileWriters == nil {
@@ -252,7 +251,7 @@ func (s *ProcessRepository) resolveFileWriter(path string, maxBytes int64, maxBa
 	if w, ok := s.fileWriters[path]; ok {
 		return w, nil
 	}
-	w, err := newRotatingFileWriter(path, maxBytes, maxBackups)
+	w, err := newRotatingFileWriter(path, maxBytes, maxBackups, compress)
 	if err != nil {
 		return nil, err
 	}

@@ -23,7 +23,7 @@ func realProcFactory() ProcessFactory {
 }
 
 func TestProcessRunReturnsExitCode(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), system.NewAdapter(), nil, nil)
 
 	code, err := m.Run(runOpts{Process: domain.Process{BinaryPath: "/bin/sh", Arguments: []string{"-c", "exit 3"}}})
 	if err != nil {
@@ -35,7 +35,7 @@ func TestProcessRunReturnsExitCode(t *testing.T) {
 }
 
 func TestProcessRunCheckThrowsOnNonZero(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), system.NewAdapter(), nil, nil)
 
 	_, err := m.Run(runOpts{Process: domain.Process{BinaryPath: "/bin/sh", Arguments: []string{"-c", "exit 4"}}, Check: true})
 	if err == nil {
@@ -48,7 +48,7 @@ func TestProcessRunCheckThrowsOnNonZero(t *testing.T) {
 
 // TestProcessRunCheckOkOnZero verifies check=true on a clean exit returns 0.
 func TestProcessRunCheckOkOnZero(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), system.NewAdapter(), nil, nil)
 
 	code, err := m.Run(runOpts{Process: domain.Process{BinaryPath: "/bin/true"}, Check: true})
 	if err != nil {
@@ -66,7 +66,7 @@ func TestProcessRunCheckOkOnZero(t *testing.T) {
 // instant the derived context expired, so the call returned an exit-code error
 // before the explicit timeout check could ever be reached.
 func TestProcessRunTimeoutKillsAndReports(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), system.NewAdapter(), nil, nil)
 
 	start := time.Now()
 	// `exec sleep 30` replaces the shell, so the kill lands on the sleeping
@@ -98,7 +98,7 @@ func TestProcessRunTimeoutKillsAndReports(t *testing.T) {
 func TestProcessHandleCancelSignalsNotKills(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "term")
 	ctx, cancel := context.WithCancel(context.Background())
-	m := NewProcessModule(ctx, realProcFactory(), nil, nil)
+	m := NewProcessModule(ctx, realProcFactory(), system.NewAdapter(), nil, nil)
 
 	h := m.Spawn(domain.ProcessNode{
 		Name: "trapper",
@@ -136,7 +136,7 @@ func TestProcessHandleCancelSignalsNotKills(t *testing.T) {
 }
 
 func TestProcessCaptureStdout(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), system.NewAdapter(), nil, nil)
 
 	res, err := m.Capture(runOpts{Process: domain.Process{BinaryPath: "/bin/echo", Arguments: []string{"hello"}}})
 	if err != nil {
@@ -151,7 +151,7 @@ func TestProcessCaptureStdout(t *testing.T) {
 }
 
 func TestProcessCaptureCheckThrowsWithStderr(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), system.NewAdapter(), nil, nil)
 
 	_, err := m.Capture(runOpts{
 		Process: domain.Process{BinaryPath: "/bin/sh", Arguments: []string{"-c", "echo oops >&2; exit 2"}},
@@ -166,7 +166,7 @@ func TestProcessCaptureCheckThrowsWithStderr(t *testing.T) {
 }
 
 func TestProcessShell(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), system.NewAdapter(), nil, nil)
 
 	code, err := m.Shell("exit 0", shellOpts{})
 	if err != nil {
@@ -302,7 +302,7 @@ func TestShellQuote(t *testing.T) {
 
 func TestProcessCaptureStreamingCallback(t *testing.T) {
 	var lines []string
-	m := NewProcessModule(context.Background(), realProcFactory(), &collectInvoker{fn: func(arg any) { lines = append(lines, arg.(string)) }}, nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), system.NewAdapter(), &collectInvoker{fn: func(arg any) { lines = append(lines, arg.(string)) }}, nil)
 
 	_, err := m.Capture(runOpts{
 		Process:  domain.Process{BinaryPath: "/bin/echo", Arguments: []string{"a\nb"}},

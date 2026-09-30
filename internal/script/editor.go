@@ -1,23 +1,29 @@
 package script
 
-import (
-	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/internal/repository"
-)
+import "github.com/supanadit/ezx/domain"
+
+// EditorOpener is the local driven-side Port for the editor module (R10): the
+// delivery layer declares what it needs and never imports the concrete editor
+// adapter.
+type EditorOpener interface {
+	OpenFileEditor(path string) domain.FileEditor
+}
 
 // EditorModule exposes ezx.editor: open(path) returns a file-editor object
 // whose methods edit the target file. It wraps domain.FileEditor.
-type EditorModule struct{}
+type EditorModule struct {
+	opener EditorOpener
+}
 
-// NewEditorModule returns an EditorModule.
-func NewEditorModule() *EditorModule {
-	return &EditorModule{}
+// NewEditorModule returns an EditorModule backed by the given opener.
+func NewEditorModule(opener EditorOpener) *EditorModule {
+	return &EditorModule{opener: opener}
 }
 
 // Open returns a script-visible editor bound to the given path. The returned
 // Editor exposes read/write/upsert/insert/block methods to scripts.
 func (m *EditorModule) Open(path string) *FileEditor {
-	return &FileEditor{inner: repository.OpenFileEditor(path)}
+	return &FileEditor{inner: m.opener.OpenFileEditor(path)}
 }
 
 // FileEditor wraps domain.FileEditor so its methods are reflected onto the

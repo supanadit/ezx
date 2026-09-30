@@ -1,8 +1,8 @@
 // Package orchestrator implements the supervisor use-case: it walks a
 // ProcessChain graph and drives each node through its lifecycle (provision →
-// probe-gated start → supervise → graceful drain) by composing the process and
-// logger Ports with the internal/repository helpers. It contains no OS
-// specifics and imports no adapter types.
+// probe-gated start → supervise → graceful drain) by composing the process,
+// logger, and its own driven-side Ports. It contains no OS specifics and
+// imports no adapter types.
 package orchestrator
 
 import (
@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/supanadit/ezx/domain"
-	"github.com/supanadit/ezx/internal/repository"
 	"github.com/supanadit/ezx/logger"
 	"github.com/supanadit/ezx/process"
+	"github.com/supanadit/ezx/rotator"
 )
 
 // ProcessFactory constructs a ProcessRepository handle for a ProcessNode. It is
@@ -28,6 +28,14 @@ type Service struct {
 	proc   ProcessFactory
 	log    logger.Logger
 	health domain.HealthService
+
+	// deps holds the driven-side ports the supervisor consumes (file
+	// provisioning, argument building, exec, probes, signal forwarding, cron).
+	deps Deps
+
+	// rotatorFactory builds a per-node log-rotation session for nodes that set
+	// LogRotate. Nil disables the feature (the default; set via SetRotator).
+	rotatorFactory rotator.Factory
 
 	// now returns the current time. It is injectable so tests can drive the
 	// scheduler deterministically (e.g. jump to the next cron boundary)
@@ -41,24 +49,27 @@ type Service struct {
 	mu        sync.Mutex
 	active    int
 	triggers  map[string]*domain.Trigger
-	schedules map[string]*repository.Cron
+	schedules map[string]func(time.Time) time.Time
 }
 
 // NewService builds a supervisor from the injected Ports. health is optional
-// (nil means health/readiness is not surfaced to the delivery layer).
+// (nil means health/readiness is not surfaced to the delivery layer). deps
+// carries the driven-side OS capabilities the supervisor consumes.
 func NewService(
 	proc ProcessFactory,
 	log logger.Logger,
 	health domain.HealthService,
+	deps Deps,
 ) *Service {
 	return &Service{
 		proc:      proc,
 		log:       log,
 		health:    health,
+		deps:      deps,
 		now:       time.Now,
 		sleep:     time.After,
 		triggers:  make(map[string]*domain.Trigger),
-		schedules: make(map[string]*repository.Cron),
+		schedules: make(map[string]func(time.Time) time.Time),
 	}
 }
 
@@ -71,6 +82,54 @@ func (s *Service) SetClock(now func() time.Time, sleep func(d time.Duration) <-c
 	if sleep != nil {
 		s.sleep = sleep
 	}
+}
+
+// SetRotator installs the factory used to rotate log files that nodes write
+// themselves (node.LogRotate). It is optional: when unset (or passed nil), a
+// node's LogRotate config is ignored. It is a setter rather than a constructor
+// parameter so existing construction sites stay unchanged.
+func (s *Service) SetRotator(f rotator.Factory) {
+	s.rotatorFactory = f
+}
+
+// liveTarget is the rotator.Target handed to a node's rotation session. It
+// tracks the current process handle so a restart is reflected without
+// restarting the watcher, and reports PID 0 once the process has exited so a
+// pass never signals a reaped (and possibly reused) PID.
+type liveTarget struct {
+	mu   sync.Mutex
+	proc process.ProcessRepository
+}
+
+func (t *liveTarget) set(p process.ProcessRepository) {
+	t.mu.Lock()
+	t.proc = p
+	t.mu.Unlock()
+}
+
+func (t *liveTarget) PID() int {
+	t.mu.Lock()
+	p := t.proc
+	t.mu.Unlock()
+	if p == nil {
+		return 0
+	}
+	select {
+	case <-p.Done():
+		return 0
+	default:
+	}
+	return p.PID()
+}
+
+func (t *liveTarget) Signal(sig os.Signal) error {
+	t.mu.Lock()
+	p := t.proc
+	t.mu.Unlock()
+	if p == nil {
+		return nil
+	}
+	return p.Signal(sig)
 }
 
 // Run executes a ProcessChain. It normalizes and validates the chain, then
@@ -475,7 +534,7 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 	}
 
 	// Provision files before starting the process.
-	if err := repository.ProvisionFiles(node.Files); err != nil {
+	if err := s.deps.Files.Provision(node.Files); err != nil {
 		s.log.Error("[%s] file provisioning failed: %v", node.Name, err)
 		return err
 	}
@@ -483,7 +542,7 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 	// Build arguments from the process environment, then create the handle so
 	// the enriched arguments reach the spawned process.
 	env := os.Environ()
-	args, err := repository.BuildArgs(node.Process, env)
+	args, err := s.deps.Args.Build(node.Process, env)
 	if err != nil {
 		s.log.Error("[%s] argument build failed: %v", node.Name, err)
 		return err
@@ -515,7 +574,7 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 			s.log.Warn("single-node chain: exec mode for %q — supervision disabled (no zombie reaping / signal forwarding); set restart, health or scheduler, or execDefault: false, to keep ezx as PID 1", node.Name)
 		}
 		s.log.Info("[%s] exec'ing to become PID 1", node.Name)
-		return repository.Exec(node.Process, env)
+		return s.deps.Exec.Exec(node.Process, env)
 	}
 
 	// A scheduled node runs its Process on a cron ticker (with manual triggers)
@@ -549,18 +608,33 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 	co.runCallback(node.Name, node.OnStart)
 	co.signalStarted(e)
 
+	// Start size-driven rotation for log files the process writes itself. The
+	// watcher lives for the node's supervised lifetime (its ctx is this node's
+	// context) and its target follows process restarts.
+	var rotate *liveTarget
+	if node.LogRotate != nil && s.rotatorFactory != nil {
+		rotate = &liveTarget{proc: proc}
+		go func() {
+			r := s.rotatorFactory()
+			if r == nil {
+				return
+			}
+			if err := r.Run(ctx, *node.LogRotate, rotate); err != nil && ctx.Err() == nil {
+				s.log.Warn("[%s] log rotation stopped: %v", node.Name, err)
+			}
+		}()
+	}
+
 	// Relay selected signals from ezx (PID 1) to the child process group.
-	var fwd *repository.Forwarder
 	if len(node.ForwardSignals) > 0 {
-		sigs, ferr := repository.ResolveForwardSignals(node.ForwardSignals)
+		sigs, ferr := s.deps.Signals.Resolve(node.ForwardSignals)
 		if ferr != nil {
 			s.log.Error("[%s] invalid forward signal: %v", node.Name, ferr)
 			return ferr
 		}
-		fwd = repository.NewForwarder(proc.PID(), sigs)
-		fwd.Start(ctx)
+		stop := s.deps.Signals.StartForwarder(ctx, proc.PID(), sigs)
 		s.log.Info("[%s] forwarding signals %v to pgid %d", node.Name, node.ForwardSignals, proc.PID())
-		defer fwd.Stop()
+		defer stop()
 	}
 
 	// Drive readiness for the node's lifetime: reset it, then poll the node's
@@ -596,7 +670,7 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 		}
 	} else if node.Readiness != nil {
 		s.log.Info("[%s] waiting for readiness", node.Name)
-		ready, err := repository.Check(ctx, *node.Readiness)
+		ready, err := s.deps.Probes.Check(ctx, *node.Readiness)
 		if err != nil {
 			s.log.Warn("[%s] readiness probe error: %v", node.Name, err)
 		}
@@ -614,7 +688,7 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 
 	// Supervise the process until it exits or the node context is cancelled
 	// (chain shutdown, a dependency permanently exited, or a fatal sibling).
-	return s.supervise(ctx, node, proc, co)
+	return s.supervise(ctx, node, proc, co, rotate)
 }
 
 // runOneshot drives a oneshot node: it provisions files, builds args, starts
@@ -627,7 +701,7 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 func (s *Service) runOneshot(ctx context.Context, e *nodeEntry, co *coordinator) error {
 	node := e.node
 	// Provision files before starting the process.
-	if err := repository.ProvisionFiles(node.Files); err != nil {
+	if err := s.deps.Files.Provision(node.Files); err != nil {
 		s.log.Error("[%s] file provisioning failed: %v", node.Name, err)
 		return err
 	}
@@ -635,7 +709,7 @@ func (s *Service) runOneshot(ctx context.Context, e *nodeEntry, co *coordinator)
 	// Build arguments from the process environment, then create the handle so
 	// the enriched arguments reach the spawned process.
 	env := os.Environ()
-	args, err := repository.BuildArgs(node.Process, env)
+	args, err := s.deps.Args.Build(node.Process, env)
 	if err != nil {
 		s.log.Error("[%s] argument build failed: %v", node.Name, err)
 		return err
@@ -773,7 +847,7 @@ func (s *Service) pollReadiness(ctx context.Context, probe *domain.Probe) {
 			return
 		case <-time.After(interval):
 		}
-		ready, err := repository.Check(ctx, *probe)
+		ready, err := s.deps.Probes.Check(ctx, *probe)
 		if err != nil {
 			s.log.Warn("health probe error: %v", err)
 		}
@@ -782,8 +856,10 @@ func (s *Service) pollReadiness(ctx context.Context, probe *domain.Probe) {
 }
 
 // supervise waits for the process, applying the restart policy and handling
-// graceful drain on context cancellation.
-func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc process.ProcessRepository, co *coordinator) error {
+// graceful drain on context cancellation. rotate, when non-nil, is the live
+// target of the node's log-rotation session; it is updated to each restarted
+// handle so rotation keeps signalling the current process.
+func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc process.ProcessRepository, co *coordinator, rotate *liveTarget) error {
 
 	shutdown := node.Shutdown
 	if shutdown == nil {
@@ -831,6 +907,9 @@ func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc p
 			proc = s.proc(node)
 			if err := proc.Start(ctx, os.Environ(), s.logConfig(node)); err != nil {
 				return err
+			}
+			if rotate != nil {
+				rotate.set(proc)
 			}
 			s.log.Info("[%s] restarted (pid=%d)", node.Name, proc.PID())
 		}
@@ -939,13 +1018,13 @@ func (s *Service) runScheduled(ctx context.Context, node domain.ProcessNode) err
 			s.log.Warn("[%s] unknown timezone %q, using local", node.Name, cfg.Schedule.Timezone)
 		}
 	}
-	cron, err := repository.ParseCron(cfg.Schedule.Expression)
+	nextAt, err := s.deps.Cron.Parse(cfg.Schedule.Expression)
 	if err != nil {
 		s.log.Error("[%s] invalid cron %q: %v", node.Name, cfg.Schedule.Expression, err)
 		return err
 	}
 	s.mu.Lock()
-	s.schedules[node.Name] = cron
+	s.schedules[node.Name] = nextAt
 	s.mu.Unlock()
 
 	minInterval := cfg.MinInterval
@@ -978,9 +1057,9 @@ func (s *Service) runScheduled(ctx context.Context, node domain.ProcessNode) err
 	var lastRun time.Time
 	for {
 		now := s.now().In(loc)
-		next := cron.Next(now)
+		when := nextAt(now)
 		var timer <-chan time.Time
-		wait := next.Sub(now)
+		wait := when.Sub(now)
 		if wait < 0 {
 			wait = 0
 		}
@@ -991,7 +1070,7 @@ func (s *Service) runScheduled(ctx context.Context, node domain.ProcessNode) err
 			s.log.Info("[%s] context cancelled, draining scheduler", node.Name)
 			return nil
 		case <-timer:
-			if s.now().Before(next) {
+			if s.now().Before(when) {
 				// timer fired slightly early (clock); recompute on next pass.
 				continue
 			}
@@ -1038,7 +1117,7 @@ func (s *Service) runTick(ctx context.Context, node domain.ProcessNode, shutdown
 	// Gate: skip the tick while the probe fails (e.g. not-primary during a
 	// backup). The loop continues, so the next schedule/trigger re-checks.
 	if node.Scheduler.Gate != nil {
-		ok, err := repository.Check(ctx, *node.Scheduler.Gate)
+		ok, err := s.deps.Probes.Check(ctx, *node.Scheduler.Gate)
 		if err != nil {
 			s.log.Warn("[%s] scheduler gate error: %v", node.Name, err)
 		}

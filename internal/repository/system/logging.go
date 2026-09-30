@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/supanadit/ezx/internal/repository"
 )
 
 // Defaults for file-backed log destinations (LogDestFile). A zero MaxBytes
@@ -23,6 +25,7 @@ type rotatingFileWriter struct {
 	path       string
 	maxBytes   int64
 	maxBackups int
+	compress   bool
 	f          *os.File
 	size       int64
 	mu         sync.Mutex
@@ -30,8 +33,9 @@ type rotatingFileWriter struct {
 
 // newRotatingFileWriter opens path in append mode (creating parent dirs),
 // applying the default MaxBytes/MaxBackups when zero. The active file's current
-// size is seeded so the first rotation triggers at the right boundary.
-func newRotatingFileWriter(path string, maxBytes int64, maxBackups int) (*rotatingFileWriter, error) {
+// size is seeded so the first rotation triggers at the right boundary. When
+// compress is true, each rotated file is gzipped (path.1 → path.1.gz).
+func newRotatingFileWriter(path string, maxBytes int64, maxBackups int, compress bool) (*rotatingFileWriter, error) {
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxBytes
 	}
@@ -54,6 +58,7 @@ func newRotatingFileWriter(path string, maxBytes int64, maxBackups int) (*rotati
 		path:       path,
 		maxBytes:   maxBytes,
 		maxBackups: maxBackups,
+		compress:   compress,
 		f:          f,
 		size:       st.Size(),
 	}, nil
@@ -92,42 +97,26 @@ func (w *rotatingFileWriter) Close() error {
 }
 
 // rotate closes the active file, shifts backups down (path.1 → path.2 → …),
-// renames the active file to path.1, drops backups beyond maxBackups, and
-// reopens a fresh path in append mode. Caller must hold w.mu.
+// renames the active file to path.1, gzips it when compression is enabled,
+// drops backups beyond maxBackups, and reopens a fresh path in append mode.
+// Caller must hold w.mu.
 func (w *rotatingFileWriter) rotate() error {
 	if err := w.f.Close(); err != nil {
 		return err
 	}
 	w.f = nil
 
-	// Find the highest existing backup index (path.1 … path.N).
-	highest := 0
-	for i := 1; ; i++ {
-		if _, err := os.Stat(fmt.Sprintf("%s.%d", w.path, i)); err != nil {
-			break
-		}
-		highest = i
+	archive, err := repository.ShiftAndRename(w.path)
+	if err != nil {
+		return err
 	}
-
-	// Shift backups down from the highest index to 1.
-	for i := highest; i >= 1; i-- {
-		if err := os.Rename(fmt.Sprintf("%s.%d", w.path, i), fmt.Sprintf("%s.%d", w.path, i+1)); err != nil {
+	if w.compress {
+		if _, err := repository.CompressArchive(archive); err != nil {
 			return err
 		}
 	}
-
-	// Move the active file to path.1.
-	if err := os.Rename(w.path, w.path+".1"); err != nil {
+	if err := repository.PruneBackups(w.path, w.maxBackups); err != nil {
 		return err
-	}
-
-	// Drop backups beyond maxBackups (bounded case). maxBackups < 0 = unlimited.
-	if w.maxBackups >= 0 {
-		for i := w.maxBackups + 1; ; i++ {
-			if err := os.Remove(fmt.Sprintf("%s.%d", w.path, i)); err != nil {
-				break
-			}
-		}
 	}
 
 	// Reopen a fresh path (append).

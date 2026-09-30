@@ -7,18 +7,26 @@ import (
 	"net/http"
 
 	"github.com/labstack/echo/v4"
-
-	"github.com/supanadit/ezx/domain"
 )
+
+// HealthService is the local Port the HTTP handler depends on (R10): the
+// readiness/liveness state. Declaring it here keeps delivery off any module's
+// concrete service type; the composition root satisfies it structurally.
+type HealthService interface {
+	// Live reports whether the process is alive.
+	Live() bool
+	// Ready reports whether the supervised process is ready.
+	Ready() bool
+}
 
 // HealthHandler registers and serves the health/readiness endpoints.
 type HealthHandler struct {
-	Service domain.HealthService
+	Service HealthService
 }
 
 // NewHealthHandler registers /livez, /readyz, and /healthz on the router. It
-// depends on the domain HealthService Port (no adapter wiring here).
-func NewHealthHandler(e *echo.Echo, svc domain.HealthService) {
+// depends on the local HealthService Port (no adapter wiring here).
+func NewHealthHandler(e *echo.Echo, svc HealthService) {
 	h := &HealthHandler{Service: svc}
 	e.GET("/livez", h.Livez)
 	e.GET("/readyz", h.Readyz)
