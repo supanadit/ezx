@@ -84,6 +84,28 @@ Every node selects how its main process is launched:
   `restart`, `health`/readiness HTTP, `scheduler`, `forwardSignals`, `probe`,
   `shutdown`, and dependency edges via `dependsOn`/`dependsOnEdges` (or the
   legacy `children` tree form). ezx reaps zombies and forwards signals.
+- **Exception — a lone node is auto-exec'd.** A chain with a **single** node
+  that sets no `restart`, no `scheduler` and no `health` is exec'd as PID 1
+  automatically, exactly as if it had declared `exec: true`. This is the
+  classic "set up then vanish" entrypoint, but it means ezx is gone: **no
+  zombie reaping and no signal forwarding**. ezx logs a warning when this
+  implicit exec fires.
+
+  Keep ezx as PID 1 either by declaring the supervision you want
+  (`restart`, `health` or `scheduler`) or by opting out explicitly:
+
+  ```js
+  chain.run({
+    execDefault: false, // stay PID 1 and supervise this lone node
+    nodes: [{ name: "app", process: { binaryPath: "/usr/bin/app" } }],
+  });
+  ```
+
+  Reach for the opt-out whenever the lone node is a real long-running service
+  rather than a fire-and-forget entrypoint: without a `wait()`-ing PID 1, any
+  process the app orphans is reparented to PID 1 and lingers as a zombie
+  forever. `execDefault: true` (or leaving it unset) preserves the implicit
+  exec.
 
 ezx is an **alternative to tini and dumb-init** that goes further. Those tools
 reap zombies and forward a couple of signals — and that's the whole job. ezx
@@ -204,7 +226,7 @@ The aggregate module exposed to scripts:
 | `crypto`    | `sha256`, `sha256File`, `base64Encode`/`base64Decode`, `randomHex` — no sha256sum |
 | `archive`   | `create`/`extract` for tar, tar.gz, zip, .gz — no tar/gunzip            |
 | `process`   | Low-level spawn / signal / wait / exec, `sleep`, `run`/`capture` with `timeout` — no sleep/timeout |
-| `chain`     | High-level declarative process graph (`chain.run({ nodes: [...] })`) |
+| `chain`     | High-level declarative process graph (`chain.run({ nodes: [...] })`; chain-level `execDefault: false` keeps ezx as PID 1 for a lone node) |
 | `config`    | Declarative config builder (`key=value`, tables, INI, fluent builder)         |
 | `yaml`      | Deterministic YAML serialization                                              |
 | `scheduler` | Cron-driven scheduled processes with gates                                    |

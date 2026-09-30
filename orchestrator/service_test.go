@@ -553,6 +553,55 @@ func TestLoneLeafRootDefaultsToExecSupervisesOnHealth(t *testing.T) {
 	}
 }
 
+// TestLoneLeafExecDefaultOptOut verifies that an explicit chain-level
+// execDefault: false keeps a lone leaf node supervised instead of exec'ing it:
+// ezx stays PID 1 and the node's process handle is started, so its supervision
+// duties (zombie reaping, signal forwarding) stay active.
+func TestLoneLeafExecDefaultOptOut(t *testing.T) {
+	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 0, nil)}
+	svc := newTestService(procs)
+
+	noExec := false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := svc.Run(ctx, domain.ProcessChain{
+		ExecDefault: &noExec,
+		Roots: []domain.ProcessNode{
+			{Name: "svc", Process: domain.Process{BinaryPath: "/bin/true"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("execDefault:false lone leaf should be supervised, got error: %v", err)
+	}
+	procs["svc"].mu.Lock()
+	started := len(procs["svc"].started)
+	procs["svc"].mu.Unlock()
+	if started < 1 {
+		t.Fatalf("execDefault:false lone leaf started %d times, want >=1 (supervised, not exec'd)", started)
+	}
+}
+
+// TestExplicitlyNoExecDefault locks the opt-out semantics: only an explicit
+// false disables the implicit exec; unset (nil) and true preserve it.
+func TestExplicitlyNoExecDefault(t *testing.T) {
+	no := false
+	yes := true
+	cases := []struct {
+		name string
+		in   *bool
+		want bool
+	}{
+		{"unset keeps default", nil, false},
+		{"true keeps default", &yes, false},
+		{"false disables", &no, true},
+	}
+	for _, tc := range cases {
+		if got := explicitlyNoExecDefault(tc.in); got != tc.want {
+			t.Errorf("%s: explicitlyNoExecDefault = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // waitScheduled polls until the named scheduled node's trigger is registered.
 func waitScheduled(t *testing.T, svc *Service, name string) {
 	t.Helper()

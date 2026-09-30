@@ -182,10 +182,14 @@ func (s *Service) runDAG(ctx context.Context, chain domain.ProcessChain) error {
 		e.pending = len(e.edges)
 	}
 
-	// A lone leaf node with no restart/scheduler/health opts into exec (PID 1).
+	// A lone leaf node with no restart/scheduler opts into exec (PID 1). The
+	// chain may opt out explicitly with execDefault: false — needed when the
+	// node is the one main process but ezx must stay PID 1 for its init duties
+	// (zombie reaping, signal forwarding, health).
 	co.execDefault = len(co.entries) == 1 &&
 		co.entries[0].node.Restart == nil &&
-		co.entries[0].node.Scheduler == nil
+		co.entries[0].node.Scheduler == nil &&
+		!explicitlyNoExecDefault(chain.ExecDefault)
 
 	var wg sync.WaitGroup
 	for _, e := range co.entries {
@@ -417,6 +421,13 @@ func (s *Service) hasActiveSiblings() bool {
 	return s.active > 0
 }
 
+// explicitlyNoExecDefault reports whether the chain opted out of the implicit
+// lone-node exec (execDefault: false). A nil or true value keeps the default:
+// only an explicit false disables it.
+func explicitlyNoExecDefault(v *bool) bool {
+	return v != nil && !*v
+}
+
 // runSingleNode drives a single node through its lifecycle: provision →
 // probe-gated start → readiness → supervise → graceful drain. It is the flat
 // DAG equivalent of the old recursive runNode minus the spawnChildren calls —
@@ -468,6 +479,11 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 	if execNode {
 		if s.hasActiveSiblings() {
 			return fmt.Errorf("exec node %q cannot have active siblings being supervised", node.Name)
+		}
+		if !node.Exec {
+			// The implicit (lone-node) exec fires: supervision is off, so say so
+			// instead of letting one info line be the only hint.
+			s.log.Warn("single-node chain: exec mode for %q — supervision disabled (no zombie reaping / signal forwarding); set restart, health or scheduler, or execDefault: false, to keep ezx as PID 1", node.Name)
 		}
 		s.log.Info("[%s] exec'ing to become PID 1", node.Name)
 		return repository.Exec(node.Process, env)

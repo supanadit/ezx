@@ -150,6 +150,15 @@ type ProcessChain struct {
 	// Edges are name references; the graph must be acyclic.
 	Nodes []ProcessNode `goja:"nodes"`
 
+	// ExecDefault, when explicitly false, disables the implicit exec of a lone
+	// chain node: a single node with no Restart/Scheduler/Health would
+	// otherwise be exec'd as PID 1, dropping ezx's supervision duties
+	// (zombie reaping, signal forwarding, health). Set it to keep ezx as PID 1
+	// without having to add a restart policy that is not actually wanted.
+	// nil (unset) and true both preserve the implicit-exec default — a pointer
+	// so "explicitly false" is distinguishable from "unset".
+	ExecDefault *bool `goja:"execDefault"`
+
 	// Roots is the legacy tree form. Deprecated for direct construction:
 	// Normalized flattens Roots/Children into Nodes. The script delivery layer
 	// always normalizes before handing the chain to the orchestrator.
@@ -215,7 +224,10 @@ func (c ProcessChain) Normalized() (ProcessChain, error) {
 		}
 		nodes[i].Edges = edges
 	}
-	return ProcessChain{Nodes: nodes}, nil
+	// ExecDefault is a chain-level policy, not a per-node one: carry it
+	// through normalization so the orchestrator can honour an explicit opt-out
+	// of the implicit lone-node exec.
+	return ProcessChain{Nodes: nodes, ExecDefault: c.ExecDefault}, nil
 }
 
 // canonicalEdges derives the canonical Edge list for a node from either
