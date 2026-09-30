@@ -141,6 +141,13 @@ type ProcessNode struct {
 	Edges []Edge `goja:"-"`
 }
 
+// CallbackGate admits a script callback for execution against the scripting
+// engine, reporting false when the callback must not run now (e.g. a
+// single-threaded engine whose script is executing rather than parked inside
+// the chain call). The delivery layer supplies it; a nil gate means callbacks
+// run unconditionally.
+type CallbackGate func(fn func()) bool
+
 // ProcessChain holds the nodes of a process dependency graph. The canonical
 // flat form is Nodes (with explicit DependsOn edges); Roots/Children is the
 // legacy recursive-tree form that Normalized desugars into Nodes. The
@@ -149,6 +156,13 @@ type ProcessChain struct {
 	// Nodes is the canonical flat form: every node, in declaration order.
 	// Edges are name references; the graph must be acyclic.
 	Nodes []ProcessNode `goja:"nodes"`
+
+	// Gate, when set, routes this chain's script callbacks (onStart, onReady,
+	// onExit, readinessFunc) through the delivery layer's admission control, so
+	// a single-threaded scripting engine is entered only while the script is
+	// parked inside the chain call. Go-only (not script-visible): the delivery
+	// layer injects it, scripts cannot set it.
+	Gate CallbackGate `goja:"-"`
 
 	// ExecDefault, when explicitly false, disables the implicit exec of a lone
 	// chain node: a single node with no Restart/Scheduler/Health would
@@ -174,7 +188,8 @@ type ProcessChain struct {
 //	C.NeedParentReady keeps its meaning, now applying to all of C's deps.
 //
 // A node that sets both Children and DependsOn (or DependsOnEdges) is rejected
-// (ambiguous). The orchestrator consumes only the canonical Edges.
+// (ambiguous). The orchestrator consumes only the canonical Edges. The
+// chain-level Gate is carried through unchanged.
 func (c ProcessChain) Normalized() (ProcessChain, error) {
 	var nodes []ProcessNode
 	if len(c.Nodes) > 0 {
@@ -227,7 +242,7 @@ func (c ProcessChain) Normalized() (ProcessChain, error) {
 	// ExecDefault is a chain-level policy, not a per-node one: carry it
 	// through normalization so the orchestrator can honour an explicit opt-out
 	// of the implicit lone-node exec.
-	return ProcessChain{Nodes: nodes, ExecDefault: c.ExecDefault}, nil
+	return ProcessChain{Nodes: nodes, ExecDefault: c.ExecDefault, Gate: c.Gate}, nil
 }
 
 // canonicalEdges derives the canonical Edge list for a node from either

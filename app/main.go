@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -95,17 +97,34 @@ func main() {
 	}
 }
 
-// startHealthServer always starts the process-wide health HTTP server,
-// defaulting the listen address to :8080 when EZX_HEALTH_ADDR is unset.
+// startHealthServer starts the process-wide health HTTP server. It listens
+// ONLY when EZX_HEALTH_ADDR is set: a container entrypoint that silently bound
+// an unexpected port (the old default, :8080) both clashed with the app's own
+// listener and could not be probed from outside without publishing a port.
+// With no EZX_HEALTH_ADDR the shared router still serves ezx.api routes
+// in-process (tests, embedded use) but nothing is exposed on the network.
+//
+// A bind failure is fatal: silently running without the health endpoints, or
+// without the script's user-defined routes, is worse than failing fast.
 func startHealthServer(e *echo.Echo, lc fx.Lifecycle) {
+	// Echo's ASCII banner belongs to a dev server, not a container entrypoint.
+	e.HideBanner = true
+	e.HidePort = true
+
 	addr := os.Getenv("EZX_HEALTH_ADDR")
 	if addr == "" {
-		addr = ":8080"
+		return
 	}
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return fmt.Errorf("health server: listen %s: %w (set EZX_HEALTH_ADDR to a free address)", addr, err)
+			}
+			fmt.Fprintf(os.Stderr, "health server: listening on %s\n", ln.Addr())
+			e.Listener = ln
 			go func() {
-				if err := e.Start(addr); err != nil && err.Error() != "http: Server closed" {
+				if err := e.Start(""); err != nil && err != http.ErrServerClosed {
 					fmt.Fprintln(os.Stderr, "health server:", err)
 				}
 			}()
@@ -163,6 +182,7 @@ func registerHostModules(
 			Sched:     orch,
 			Routes:    e,
 			Callbacks: b.Invoker(),
+			Gate:      b.Gate(),
 		})
 	})
 }

@@ -22,7 +22,7 @@ func realProcFactory() ProcessFactory {
 }
 
 func TestProcessRunReturnsExitCode(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
 
 	code, err := m.Run(runOpts{Process: domain.Process{BinaryPath: "/bin/sh", Arguments: []string{"-c", "exit 3"}}})
 	if err != nil {
@@ -34,7 +34,7 @@ func TestProcessRunReturnsExitCode(t *testing.T) {
 }
 
 func TestProcessRunCheckThrowsOnNonZero(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
 
 	_, err := m.Run(runOpts{Process: domain.Process{BinaryPath: "/bin/sh", Arguments: []string{"-c", "exit 4"}}, Check: true})
 	if err == nil {
@@ -46,7 +46,7 @@ func TestProcessRunCheckThrowsOnNonZero(t *testing.T) {
 }
 
 func TestProcessRunCheckOkOnZero(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
 
 	code, err := m.Run(runOpts{Process: domain.Process{BinaryPath: "/bin/true"}, Check: true})
 	if err != nil {
@@ -58,7 +58,7 @@ func TestProcessRunCheckOkOnZero(t *testing.T) {
 }
 
 func TestProcessCaptureStdout(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
 
 	res, err := m.Capture(runOpts{Process: domain.Process{BinaryPath: "/bin/echo", Arguments: []string{"hello"}}})
 	if err != nil {
@@ -73,7 +73,7 @@ func TestProcessCaptureStdout(t *testing.T) {
 }
 
 func TestProcessCaptureCheckThrowsWithStderr(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
 
 	_, err := m.Capture(runOpts{
 		Process: domain.Process{BinaryPath: "/bin/sh", Arguments: []string{"-c", "echo oops >&2; exit 2"}},
@@ -88,7 +88,7 @@ func TestProcessCaptureCheckThrowsWithStderr(t *testing.T) {
 }
 
 func TestProcessShell(t *testing.T) {
-	m := NewProcessModule(context.Background(), realProcFactory(), nil)
+	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
 
 	code, err := m.Shell("exit 0", shellOpts{})
 	if err != nil {
@@ -224,7 +224,7 @@ func TestShellQuote(t *testing.T) {
 
 func TestProcessCaptureStreamingCallback(t *testing.T) {
 	var lines []string
-	m := NewProcessModule(context.Background(), realProcFactory(), &collectInvoker{fn: func(arg any) { lines = append(lines, arg.(string)) }})
+	m := NewProcessModule(context.Background(), realProcFactory(), &collectInvoker{fn: func(arg any) { lines = append(lines, arg.(string)) }}, nil)
 
 	_, err := m.Capture(runOpts{
 		Process:  domain.Process{BinaryPath: "/bin/echo", Arguments: []string{"a\nb"}},

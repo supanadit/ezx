@@ -32,6 +32,10 @@ type Deps struct {
 	// Callbacks invokes script-provided functions for ezx.api handlers
 	// (nil = engine without callback support).
 	Callbacks runtime.Invoker
+	// Gate is the scripting engine's entry gate (nil = engine without
+	// callback support). Blocking host calls park through it, which is what
+	// admits lifecycle and scheduler callbacks while the script is suspended.
+	Gate runtime.Gate
 }
 
 // EzxModule is the aggregate module exposed to scripts as require("ezx"). It
@@ -62,9 +66,9 @@ func NewEzxModule(d Deps) *EzxModule {
 	return &EzxModule{
 		Env:       NewEnvModule(),
 		Editor:    NewEditorModule(),
-		Process:   NewProcessModule(d.Ctx, d.Proc, d.Callbacks),
+		Process:   NewProcessModule(d.Ctx, d.Proc, d.Callbacks, d.Gate),
 		Log:       NewLogModule(d.Log),
-		Chain:     NewChainModule(d.Ctx, d.Chain),
+		Chain:     NewChainModule(d.Ctx, d.Chain, d.Gate),
 		FS:        NewFSModule(),
 		Net:       NewNetModule(d.Ctx),
 		Crypto:    NewCryptoModule(),

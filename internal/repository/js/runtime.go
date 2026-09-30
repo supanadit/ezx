@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/require"
@@ -54,26 +55,197 @@ func (e *Engine) RunString(ctx context.Context, source string) error {
 }
 
 // vmBinder is the runtime.Binder implementation handed to ModuleLoaders while
-// host modules are bound into a fresh VM.
+// host modules are bound into a fresh VM. gate is shared by every binder of
+// that VM, so all callback paths (lifecycle callbacks, scheduler ticks, HTTP
+// routes, streaming handlers) serialize through one gate.
 type vmBinder struct {
-	vm *goja.Runtime
+	vm   *goja.Runtime
+	gate *vmGate
 }
 
 // Invoker returns a callback invoker bound to this VM.
-func (b vmBinder) Invoker() runtime.Invoker { return vmInvoker{vm: b.vm} }
+func (b vmBinder) Invoker() runtime.Invoker { return b.gate }
 
-// vmInvoker calls script function values (delivered as `any` by delivery
-// code) inside this VM.
-type vmInvoker struct {
+// Gate returns the script-entry gate bound to this VM. Host modules park
+// through it around blocking calls so callbacks can be admitted safely.
+func (b vmBinder) Gate() runtime.Gate { return b.gate }
+
+// vmGate is the goja adapter's runtime.Gate. It is the single point that
+// decides whether a callback may enter the VM right now:
+//
+//   - parked: the script goroutine is suspended inside a blocking host call
+//     (chain.run's event router, a one-shot process run, a probe poll), which
+//     is exactly when lifecycle and scheduler callbacks fire.
+//   - running: the script frame is live — a callback must not enter; Call
+//     returns runtime.ErrNotParked and the caller skips it.
+//
+// entry serializes admitted callbacks so two node goroutines exiting at the
+// same instant cannot be inside the VM together. Entry is deliberately
+// non-reentrant: a callback must not call a blocking host function, which the
+// callback contract already requires ("short and non-blocking"); best-effort
+// deliveries (process.run's streaming lines) use TryCall so they degrade to a
+// skip instead of blocking a callback that is already inside the VM.
+type vmGate struct {
 	vm *goja.Runtime
+
+	// gateCh is closed while the script is parked (callbacks admitted).
+	gateCh chan struct{}
+	// entry admits one callback at a time.
+	entry sync.Mutex
+
+	mu       sync.Mutex
+	parkN    int // nesting depth of Park/Unpark
+	inFlight int // callbacks currently inside the VM
+	idle     *sync.Cond
 }
 
-// Call invokes fn — a callable goja value delivered by reflection binding.
+// newVMGate returns a gate for the given VM, starting in the running state.
+func newVMGate(vm *goja.Runtime) *vmGate {
+	g := &vmGate{
+		vm:     vm,
+		gateCh: make(chan struct{}),
+	}
+	close(g.gateCh)
+	g.idle = sync.NewCond(&g.mu)
+	return g
+}
+
+// Park declares the script suspended in a blocking host call, opening the
+// callback window. It is called by the script goroutine only, and nests with
+// Unpark.
+func (g *vmGate) Park() {
+	g.mu.Lock()
+	g.parkN++
+	if g.parkN == 1 {
+		g.gateCh = make(chan struct{})
+	}
+	g.mu.Unlock()
+}
+
+// Unpark resumes the script. The outermost Unpark closes the callback window,
+// then waits for any in-flight callback to leave the VM before returning, so a
+// script frame never resumes while a callback is still executing.
+func (g *vmGate) Unpark() {
+	g.mu.Lock()
+	if g.parkN > 0 {
+		g.parkN--
+	}
+	if g.parkN == 0 {
+		g.gateCh = make(chan struct{})
+		for g.inFlight > 0 {
+			g.idle.Wait()
+		}
+	}
+	g.mu.Unlock()
+}
+
+// Parked returns a channel closed while the script is parked, i.e. while
+// callbacks are admitted.
+func (g *vmGate) Parked() <-chan struct{} {
+	g.mu.Lock()
+	ch := g.gateCh
+	g.mu.Unlock()
+	return ch
+}
+
+// Call invokes fn inside the VM. It refuses with runtime.ErrNotParked when the
+// script is not parked (entering then would race a live script frame), and
+// otherwise serializes with any other callback.
+func (g *vmGate) Call(fn any, args ...any) (any, error) {
+	if !g.isParked() {
+		return nil, runtime.ErrNotParked
+	}
+	g.entry.Lock()
+	defer g.entry.Unlock()
+
+	// Re-check after waiting for the entry lock: Unpark may have resumed the
+	// script in the meantime, in which case the VM must not be entered.
+	if !g.isParked() {
+		return nil, runtime.ErrNotParked
+	}
+	return g.enter(fn, args...)
+}
+
+// TryCall is the non-blocking variant of Call: it returns runtime.ErrNotParked
+// when the script is not parked or another callback is currently inside the
+// VM, instead of waiting. Best-effort deliveries (process.run's onStdout/
+// onStderr lines) use it so they never block or re-enter the VM.
+func (g *vmGate) TryCall(fn any, args ...any) (any, error) {
+	if !g.isParked() {
+		return nil, runtime.ErrNotParked
+	}
+	if !g.entry.TryLock() {
+		return nil, runtime.ErrNotParked
+	}
+	defer g.entry.Unlock()
+	if !g.isParked() {
+		return nil, runtime.ErrNotParked
+	}
+	return g.enter(fn, args...)
+}
+
+// enter runs fn inside the VM, tracked so Unpark can wait for it to finish.
+func (g *vmGate) enter(fn any, args ...any) (any, error) {
+	g.mu.Lock()
+	g.inFlight++
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.inFlight--
+		g.idle.Broadcast()
+		g.mu.Unlock()
+	}()
+	return invoke(g.vm, fn, args...)
+}
+
+// Do runs fn inside the callback window, serialized with other callbacks, and
+// reports whether it ran. It returns false instead of blocking when the script
+// is running.
+func (g *vmGate) Do(fn func()) bool {
+	if fn == nil {
+		return false
+	}
+	if !g.isParked() {
+		return false
+	}
+	// Serialize with any other callback. The wait is bounded: callbacks are
+	// required to be short and non-blocking, and an admitted callback never
+	// waits on the script goroutine.
+	g.entry.Lock()
+	defer g.entry.Unlock()
+
+	// Re-check after waiting for the entry lock: Unpark may have resumed the
+	// script in the meantime, in which case the callback must be skipped.
+	if !g.isParked() {
+		return false
+	}
+	g.mu.Lock()
+	g.inFlight++
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.inFlight--
+		g.idle.Broadcast()
+		g.mu.Unlock()
+	}()
+	fn()
+	return true
+}
+
+// isParked reports whether the script is currently suspended.
+func (g *vmGate) isParked() bool {
+	g.mu.Lock()
+	parked := g.parkN > 0
+	g.mu.Unlock()
+	return parked
+}
+
+// invoke calls fn — a callable goja value delivered by reflection binding.
 // For an `any` parameter goja delivers a native wrapper of type
 // func(goja.FunctionCall) goja.Value; direct goja.Callable / goja.Value
 // shapes are accepted too. Args are converted from Go values and the result
 // is exported to a plain Go value.
-func (i vmInvoker) Call(fn any, args ...any) (any, error) {
+func invoke(vm *goja.Runtime, fn any, args ...any) (any, error) {
 	var callable goja.Callable
 	switch v := fn.(type) {
 	case goja.Callable:
@@ -94,7 +266,7 @@ func (i vmInvoker) Call(fn any, args ...any) (any, error) {
 	}
 	goArgs := make([]goja.Value, len(args))
 	for j, a := range args {
-		goArgs[j] = i.vm.ToValue(a)
+		goArgs[j] = vm.ToValue(a)
 	}
 	res, err := callable(goja.Undefined(), goArgs...)
 	if err != nil {
@@ -108,6 +280,8 @@ func (i vmInvoker) Call(fn any, args ...any) (any, error) {
 
 // runSource executes the given source on a fresh goja runtime with the given
 // program name, registering the host modules and wiring context cancellation.
+// The VM starts in the running state: callbacks are admitted only while the
+// script parks inside a blocking host call (see runtime.Gate).
 func (e *Engine) runSource(ctx context.Context, name, source string) error {
 	vm := goja.New()
 	vm.SetFieldNameMapper(newFieldNameMapper())
@@ -116,7 +290,8 @@ func (e *Engine) runSource(ctx context.Context, name, source string) error {
 	// registered host modules.
 	registry := require.NewRegistry(require.WithGlobalFolders())
 	registry.Enable(vm)
-	binder := vmBinder{vm: vm}
+	gate := newVMGate(vm)
+	binder := vmBinder{vm: vm, gate: gate}
 	for name, loader := range e.registry.Modules() {
 		n := name
 		l := loader

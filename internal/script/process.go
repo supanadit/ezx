@@ -28,13 +28,16 @@ type ProcessModule struct {
 	ctx     context.Context
 	factory ProcessFactory
 	inv     runtime.Invoker
+	gate    runtime.Gate
 }
 
 // NewProcessModule returns a ProcessModule backed by the given factory,
 // interrupting spawned processes when ctx is cancelled. inv is used to deliver
-// streaming callbacks; it may be nil when the engine cannot call back.
-func NewProcessModule(ctx context.Context, factory ProcessFactory, inv runtime.Invoker) *ProcessModule {
-	return &ProcessModule{ctx: ctx, factory: factory, inv: inv}
+// streaming callbacks; it may be nil when the engine cannot call back. gate is
+// the scripting engine's entry gate: run/capture/shell park it while blocked
+// on the child process so its onStdout/onStderr callbacks are admitted safely.
+func NewProcessModule(ctx context.Context, factory ProcessFactory, inv runtime.Invoker, gate runtime.Gate) *ProcessModule {
+	return &ProcessModule{ctx: ctx, factory: factory, inv: inv, gate: gate}
 }
 
 // Spawn launches a process from a JS options object (binary, args, env,
@@ -200,6 +203,10 @@ type shellOpts struct {
 // oneshot spawns the process, waits, returns the exit code and any captured
 // stdout/stderr, and delivers streaming callbacks (if any) post-hoc. A
 // positive opts.Timeout derives a timeout context (timeout(1) equivalent).
+//
+// While blocked on the child it parks the scripting engine: the onStdout/
+// onStderr callbacks run inside the VM from this goroutine, so the script frame
+// must be suspended for them (see runtime.Gate).
 func (m *ProcessModule) oneshot(opts runOpts, lc domain.LogConfig) (code int, stdout, stderr string, err error) {
 	node := domain.ProcessNode{Name: opts.Name, Process: opts.Process}
 	proc := m.factory(node)
@@ -213,7 +220,13 @@ func (m *ProcessModule) oneshot(opts runOpts, lc domain.LogConfig) (code int, st
 	if err := proc.Start(startCtx, os.Environ(), lc); err != nil {
 		return -1, "", "", err
 	}
+	if m.gate != nil {
+		m.gate.Park()
+	}
 	code, err = proc.Wait()
+	if m.gate != nil {
+		m.gate.Unpark()
+	}
 	if err != nil {
 		return code, "", "", err
 	}
@@ -231,9 +244,15 @@ func (m *ProcessModule) oneshot(opts runOpts, lc domain.LogConfig) (code int, st
 // Sleep blocks the script for the given duration in nanoseconds — the native
 // replacement for sleep(1) (e.g. process.sleep(2e9) = 2 seconds). Sleeping
 // does not block the Go runtime; the interrupted-context is not consumed.
+// The wait parks the scripting engine, so scheduler ticks and lifecycle
+// callbacks may run while the script sleeps.
 func (m *ProcessModule) Sleep(ns int64) error {
 	if ns < 0 {
 		return fmt.Errorf("process.sleep: negative duration")
+	}
+	if m.gate != nil {
+		m.gate.Park()
+		defer m.gate.Unpark()
 	}
 	timer := time.NewTimer(time.Duration(ns))
 	defer timer.Stop()
@@ -247,12 +266,24 @@ func (m *ProcessModule) Sleep(ns int64) error {
 
 // deliverLines invokes fn once per non-empty line of out (post-hoc line
 // splitting, the simple version). A nil invoker or nil fn is a no-op.
+//
+// Delivery is best-effort: it uses TryInvoker when the engine provides it, so
+// a script that is not parked (or an engine that is already busy) skips the
+// remaining lines instead of blocking this goroutine or re-entering a
+// single-threaded VM that is already inside a callback.
 func deliverLines(inv runtime.Invoker, fn any, out string) {
 	if inv == nil || fn == nil || out == "" {
 		return
 	}
+	try, ok := inv.(runtime.TryInvoker)
 	for _, line := range strings.Split(out, "\n") {
 		if line == "" {
+			continue
+		}
+		if ok {
+			if _, err := try.TryCall(fn, line); err != nil {
+				return
+			}
 			continue
 		}
 		_, _ = inv.Call(fn, line)

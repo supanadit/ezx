@@ -36,6 +36,7 @@ func registerTestHostModule(reg *runtime.Registry, ctx context.Context, log logg
 			Sched:     orch,
 			Routes:    router,
 			Callbacks: b.Invoker(),
+			Gate:      b.Gate(),
 		})
 	})
 }
@@ -221,12 +222,12 @@ func (f *e2eFakeProc) Start(_ context.Context, _ []string, _ domain.LogConfig) e
 	close(f.done)
 	return nil
 }
-func (f *e2eFakeProc) Wait() (int, error)         { <-f.done; return 0, nil }
-func (f *e2eFakeProc) Signal(os.Signal) error     { return nil }
-func (f *e2eFakeProc) Kill() error                { return nil }
-func (f *e2eFakeProc) PID() int                   { return 1 }
-func (f *e2eFakeProc) Done() <-chan struct{}      { return f.done }
-func (f *e2eFakeProc) Output() (string, string)   { return "", "" }
+func (f *e2eFakeProc) Wait() (int, error)       { <-f.done; return 0, nil }
+func (f *e2eFakeProc) Signal(os.Signal) error   { return nil }
+func (f *e2eFakeProc) Kill() error              { return nil }
+func (f *e2eFakeProc) PID() int                 { return 1 }
+func (f *e2eFakeProc) Done() <-chan struct{}    { return f.done }
+func (f *e2eFakeProc) Output() (string, string) { return "", "" }
 
 // TestScriptEndToEndManualTrigger runs the real flow: a JS script registers a
 // user-defined route, then chain.run's a scheduled node (blocking). The test

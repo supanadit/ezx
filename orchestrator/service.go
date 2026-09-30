@@ -134,12 +134,35 @@ type coordinator struct {
 	chainCtx    context.Context
 	cancel      context.CancelFunc
 	execDefault bool
+	// gate admits script callbacks (onStart/onReady/onExit/readinessFunc) for
+	// this chain. Nil when the chain carries none, in which case callbacks run
+	// directly (see runCallback).
+	gate domain.CallbackGate
 
 	mu      sync.Mutex
 	entries []*nodeEntry
 	byName  map[string]*nodeEntry
 	errOnce sync.Once
 	errCh   chan error
+}
+
+// runCallback runs a script lifecycle callback through the chain's gate, so a
+// single-threaded scripting engine is entered only while the script is parked
+// (it is, for the whole chain call). It reports whether the callback ran: false
+// means the engine refused admission (e.g. the script resumed and is executing
+// again), and the callback is skipped rather than raced. A chain without a gate
+// runs the callback unconditionally.
+func (co *coordinator) runCallback(name string, fn func()) {
+	if fn == nil {
+		return
+	}
+	if co.gate == nil {
+		fn()
+		return
+	}
+	if !co.gate(fn) {
+		co.s.log.Warn("[%s] script callback skipped: script engine is busy with the running script", name)
+	}
 }
 
 // runDAG drives a normalized, validated flat chain. Every node runs in its own
@@ -155,6 +178,7 @@ func (s *Service) runDAG(ctx context.Context, chain domain.ProcessChain) error {
 		s:      s,
 		errCh:  make(chan error, 1),
 		byName: make(map[string]*nodeEntry, len(chain.Nodes)),
+		gate:   chain.Gate,
 	}
 	co.chainCtx, co.cancel = context.WithCancel(ctx)
 	defer co.cancel()
@@ -480,7 +504,12 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 		if s.hasActiveSiblings() {
 			return fmt.Errorf("exec node %q cannot have active siblings being supervised", node.Name)
 		}
-		if !node.Exec {
+		// Any exec node drops ezx's supervision duties (zombie reaping,
+		// signal forwarding): say so for the explicit `exec: true` case too,
+		// not only for the implicit lone-node default.
+		if node.Exec {
+			s.log.Warn("exec node %q — supervision disabled (no zombie reaping / signal forwarding); ezx is replaced by the app as PID 1", node.Name)
+		} else {
 			// The implicit (lone-node) exec fires: supervision is off, so say so
 			// instead of letting one info line be the only hint.
 			s.log.Warn("single-node chain: exec mode for %q — supervision disabled (no zombie reaping / signal forwarding); set restart, health or scheduler, or execDefault: false, to keep ezx as PID 1", node.Name)
@@ -517,9 +546,7 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 		return err
 	}
 	s.log.Info("[%s] started (pid=%d)", node.Name, proc.PID())
-	if node.OnStart != nil {
-		node.OnStart()
-	}
+	co.runCallback(node.Name, node.OnStart)
 	co.signalStarted(e)
 
 	// Relay selected signals from ezx (PID 1) to the child process group.
@@ -557,15 +584,15 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 	// then set the health/readiness state and fire OnReady identically.
 	if node.ReadinessFunc != nil {
 		s.log.Info("[%s] waiting for readiness (callback)", node.Name)
-		ready := s.pollReadinessFunc(ctx, node)
+		ready := s.pollReadinessFunc(ctx, node, co)
 		if !ready {
 			s.log.Error("[%s] never became ready", node.Name)
 		}
 		if node.Health != nil && s.health != nil {
 			s.health.SetReady(ready)
 		}
-		if ready && node.OnReady != nil {
-			node.OnReady()
+		if ready {
+			co.runCallback(node.Name, node.OnReady)
 		}
 	} else if node.Readiness != nil {
 		s.log.Info("[%s] waiting for readiness", node.Name)
@@ -579,15 +606,15 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 		if node.Health != nil && s.health != nil {
 			s.health.SetReady(ready)
 		}
-		if ready && node.OnReady != nil {
-			node.OnReady()
+		if ready {
+			co.runCallback(node.Name, node.OnReady)
 		}
 	}
 	co.signalReady(e)
 
 	// Supervise the process until it exits or the node context is cancelled
 	// (chain shutdown, a dependency permanently exited, or a fatal sibling).
-	return s.supervise(ctx, node, proc)
+	return s.supervise(ctx, node, proc, co)
 }
 
 // runOneshot drives a oneshot node: it provisions files, builds args, starts
@@ -647,7 +674,7 @@ func (s *Service) runOneshot(ctx context.Context, e *nodeEntry, co *coordinator)
 			code, werr := proc.Wait()
 			s.log.Info("[%s] oneshot finished (code=%d)", node.Name, code)
 			if node.OnExit != nil {
-				node.OnExit(code)
+				co.runCallback(node.Name, func() { node.OnExit(code) })
 			}
 			if code == 0 {
 				// Success: unblock dependents (a oneshot is "ready" only when
@@ -680,7 +707,7 @@ func (s *Service) runOneshot(ctx context.Context, e *nodeEntry, co *coordinator)
 // true or ctx is cancelled. When node.Readiness is set its Interval/Timeout and
 // MaxAttempts are honored (MaxAttempts <= 0 means poll until ctx is cancelled);
 // otherwise it defaults to polling every second until ctx is cancelled.
-func (s *Service) pollReadinessFunc(ctx context.Context, node domain.ProcessNode) bool {
+func (s *Service) pollReadinessFunc(ctx context.Context, node domain.ProcessNode, co *coordinator) bool {
 	interval := time.Second
 	maxAttempts := 0
 	if node.Readiness != nil {
@@ -702,7 +729,7 @@ func (s *Service) pollReadinessFunc(ctx context.Context, node domain.ProcessNode
 			return false
 		default:
 		}
-		if node.ReadinessFunc() {
+		if s.callReadinessFunc(co, node) {
 			return true
 		}
 		timer := time.NewTimer(interval)
@@ -714,6 +741,20 @@ func (s *Service) pollReadinessFunc(ctx context.Context, node domain.ProcessNode
 		}
 	}
 	return false
+}
+
+// callReadinessFunc runs the node's readinessFunc through the chain's callback
+// gate and reports its result. A refused admission (the engine is executing the
+// script again, which happens once the chain call has returned) is "not ready"
+// for this attempt, so the poll loop keeps waiting until its context ends
+// rather than racing the script.
+func (s *Service) callReadinessFunc(co *coordinator, node domain.ProcessNode) bool {
+	if node.ReadinessFunc == nil {
+		return false
+	}
+	ready := false
+	co.runCallback(node.Name, func() { ready = node.ReadinessFunc() })
+	return ready
 }
 
 // pollReadiness polls the probe and reports readiness on the health service
@@ -742,7 +783,8 @@ func (s *Service) pollReadiness(ctx context.Context, probe *domain.Probe) {
 
 // supervise waits for the process, applying the restart policy and handling
 // graceful drain on context cancellation.
-func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc process.ProcessRepository) error {
+func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc process.ProcessRepository, co *coordinator) error {
+
 	shutdown := node.Shutdown
 	if shutdown == nil {
 		sig := os.Signal(syscall.SIGTERM)
@@ -765,7 +807,7 @@ func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc p
 			code, err := proc.Wait()
 			s.log.Info("[%s] process exited (code=%d)", node.Name, code)
 			if node.OnExit != nil {
-				node.OnExit(code)
+				co.runCallback(node.Name, func() { node.OnExit(code) })
 			}
 
 			shouldRestart := s.shouldRestart(node, code)
