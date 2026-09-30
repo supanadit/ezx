@@ -86,7 +86,19 @@ func (s *ProcessRepository) Start(ctx context.Context, env []string, lc domain.L
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, s.node.Process.BinaryPath, s.node.Process.Arguments...)
+	// Deliberately NOT exec.CommandContext: CommandContext arms a watcher that
+	// SIGKILLs the child the moment ctx is done, which is exactly the wrong
+	// behaviour for a supervisor. Draining is explicit and cooperative
+	// (drain: shutdown signal -> timeout -> force-kill), so a cancel-triggered
+	// SIGKILL both destroys graceful shutdown (the app never sees SIGTERM) and
+	// silently defeats every caller-supplied timeout (the kill lands before the
+	// caller can report one). A cancellation watcher would also leak a blocked
+	// goroutine per spawned process, because the shared reaper — not cmd.Wait —
+	// is the waiter on this PID, so the watcher's unbuffered result channel is
+	// never drained. ctx remains a parameter because the Port contract carries
+	// it and future adapters may use it.
+	_ = ctx
+	cmd := exec.Command(s.node.Process.BinaryPath, s.node.Process.Arguments...)
 	// An empty (or nil) process environment means "inherit the parent's
 	// environment" — matching Go's exec.Cmd semantics (cmd.Env == nil inherits).
 	// Without this, script calls like process.spawn(...).start([]) would spawn a

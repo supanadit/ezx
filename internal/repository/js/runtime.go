@@ -302,10 +302,23 @@ func (e *Engine) runSource(ctx context.Context, name, source string) error {
 
 	// Enable interrupt on context cancellation (e.g. SIGTERM triggers the
 	// caller's context cancellation, which interrupts a runaway script).
+	//
+	// The interrupt is withheld while the script is parked in a blocking host
+	// call. goja's Interrupt is not park-aware: firing it at a parked script
+	// unwinds that host call, and for chain.run — the main parking window — that
+	// meant aborting a chain that was already draining, so a clean SIGTERM
+	// shutdown surfaced as "run script: context cancelled" and ezx exited 1
+	// instead of reporting success. A parked script has, by definition, handed
+	// control to Go, so the host call owns the cancellation (chain.run drains
+	// its nodes; process.sleep returns ctx.Err()). Only a script that is
+	// genuinely executing again is interrupted.
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
+			if gate.isParked() {
+				return
+			}
 			vm.Interrupt("context cancelled")
 		case <-done:
 		}

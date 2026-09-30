@@ -23,3 +23,29 @@ jobs:
           cache: true
       - name: Run tests
         run: go test ./...
+
+  smoke:
+    name: Container smoke (PID 1 semantics)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      # The headline promise (PID 1 identity, zombie reaping, signal forwarding,
+      # graceful drain) is only observable in a real container: unit tests cover
+      # none of it. Running the script here is what catches a regression such as
+      # a spawn path that SIGKILLs every supervised process on cancel — which
+      # passes `go test ./...` while breaking every entrypoint.
+      - name: Install podman
+        run: |
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+          podman --version
+      - name: Run container smoke test
+        run: bash tests/e2e/smoke.sh

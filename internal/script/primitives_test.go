@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/supanadit/ezx/domain"
 	"github.com/supanadit/ezx/internal/repository/system"
@@ -45,6 +46,7 @@ func TestProcessRunCheckThrowsOnNonZero(t *testing.T) {
 	}
 }
 
+// TestProcessRunCheckOkOnZero verifies check=true on a clean exit returns 0.
 func TestProcessRunCheckOkOnZero(t *testing.T) {
 	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
 
@@ -54,6 +56,82 @@ func TestProcessRunCheckOkOnZero(t *testing.T) {
 	}
 	if code != 0 {
 		t.Fatalf("code = %d, want 0", code)
+	}
+}
+
+// TestProcessRunTimeoutKillsAndReports pins the timeout contract: an
+// opts.Timeout that elapses must kill the process and surface a "timed out"
+// error. It used to pass for the wrong reason — the process adapter spawns via
+// exec.CommandContext, whose cancellation watcher SIGKILLed the child the
+// instant the derived context expired, so the call returned an exit-code error
+// before the explicit timeout check could ever be reached.
+func TestProcessRunTimeoutKillsAndReports(t *testing.T) {
+	m := NewProcessModule(context.Background(), realProcFactory(), nil, nil)
+
+	start := time.Now()
+	// `exec sleep 30` replaces the shell, so the kill lands on the sleeping
+	// process (a signal to a shell blocked in `sleep 30` would be handled only
+	// after sleep returns).
+	code, err := m.Run(runOpts{
+		Process: domain.Process{BinaryPath: "/bin/sh", Arguments: []string{"-c", "exec sleep 30"}},
+		Timeout: int64(300 * time.Millisecond),
+	})
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %v, want it to report the timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("timeout took %v, want it bounded by the 300ms budget", elapsed)
+	}
+	if code == 0 {
+		t.Fatalf("killed process reported exit code 0")
+	}
+}
+
+// TestProcessHandleCancelSignalsNotKills pins the spawn cancellation contract:
+// cancelling the module context must interrupt a spawned process with a signal
+// it can trap (graceful), never an uncatchable SIGKILL. Before the fix this was
+// a SIGKILL from os/exec's cancellation watcher, so a trap-based shutdown never
+// ran.
+func TestProcessHandleCancelSignalsNotKills(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "term")
+	ctx, cancel := context.WithCancel(context.Background())
+	m := NewProcessModule(ctx, realProcFactory(), nil, nil)
+
+	h := m.Spawn(domain.ProcessNode{
+		Name: "trapper",
+		Process: domain.Process{
+			BinaryPath: "/bin/sh",
+			Arguments:  []string{"-c", `trap 'echo trapped > "$MARKER"; exit 0' TERM; while true; do sleep 0.1; done`},
+			Environment: []string{
+				"MARKER=" + marker,
+			},
+		},
+	})
+	if err := h.Start(nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+
+	waitErr := make(chan error, 1)
+	go func() {
+		_, err := h.Wait()
+		waitErr <- err
+	}()
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("process did not exit after cancellation (was it SIGKILLed?)")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("cancellation did not reach the process as a catchable signal: %v", err)
 	}
 }
 

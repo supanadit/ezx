@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -51,6 +52,9 @@ func (m *ProcessModule) Spawn(node domain.ProcessNode) *ProcessHandle {
 type ProcessHandle struct {
 	ctx  context.Context
 	repo process.ProcessRepository
+
+	cancelOnce sync.Once
+	cancelDone chan struct{}
 }
 
 // Exec replaces the current process image (PID 1) with the given process via
@@ -60,17 +64,45 @@ func (m *ProcessModule) Exec(node domain.ProcessNode) error {
 	return repository.Exec(node.Process, os.Environ())
 }
 
-// Start launches the process (idempotent).
+// Start launches the process (idempotent) and begins watching the module's
+// cancellation context, so a spawned process is interrupted when the app shuts
+// down. The watcher exits as soon as the process does (it selects on the
+// repo's Done), so unlike os/exec's CommandContext watcher it cannot leak a
+// goroutine per spawn; and it signals rather than kills, so the caller's own
+// cooperative shutdown still wins.
 func (h *ProcessHandle) Start(env []string) error {
-	return h.repo.Start(h.ctx, env, domain.LogConfig{
+	if err := h.repo.Start(h.ctx, env, domain.LogConfig{
 		Stdout: domain.LogDestStdout,
 		Stderr: domain.LogDestStderr,
+	}); err != nil {
+		return err
+	}
+	h.cancelOnce.Do(func() {
+		h.cancelDone = make(chan struct{})
+		go h.watchCancel()
 	})
+	return nil
+}
+
+// watchCancel interrupts the process on context cancellation. A process that
+// ignores the signal is left to the orchestrator's drain timeout or to exit on
+// its own; this path never escalates to SIGKILL.
+func (h *ProcessHandle) watchCancel() {
+	defer close(h.cancelDone)
+	select {
+	case <-h.ctx.Done():
+		_ = h.repo.Signal(syscall.SIGTERM)
+	case <-h.repo.Done():
+	}
 }
 
 // Wait blocks until the process exits and returns its exit code.
 func (h *ProcessHandle) Wait() (int, error) {
-	return h.repo.Wait()
+	code, err := h.repo.Wait()
+	if h.cancelDone != nil {
+		<-h.cancelDone
+	}
+	return code, err
 }
 
 // Signal sends a signal to the process by name (SIGTERM, SIGINT, SIGKILL...).
@@ -201,8 +233,15 @@ type shellOpts struct {
 }
 
 // oneshot spawns the process, waits, returns the exit code and any captured
-// stdout/stderr, and delivers streaming callbacks (if any) post-hoc. A
-// positive opts.Timeout derives a timeout context (timeout(1) equivalent).
+// stdout/stderr, and delivers streaming callbacks (if any) post-hoc. A positive
+// opts.Timeout bounds the wait (the timeout(1) equivalent): the timer kills the
+// process and the call fails with a "timed out" error.
+//
+// The timeout is enforced here, not by the process adapter, because the adapter
+// deliberately spawns without a cancellation watcher (a ctx-triggered SIGKILL
+// would pre-empt drain's cooperative shutdown signal -> timeout -> force-kill,
+// and leak a goroutine per spawn while the reaper owns the wait). Kill is the
+// only escalation a bounded one-shot needs.
 //
 // While blocked on the child it parks the scripting engine: the onStdout/
 // onStderr callbacks run inside the VM from this goroutine, so the script frame
@@ -211,15 +250,33 @@ func (m *ProcessModule) oneshot(opts runOpts, lc domain.LogConfig) (code int, st
 	node := domain.ProcessNode{Name: opts.Name, Process: opts.Process}
 	proc := m.factory(node)
 
-	startCtx := m.ctx
-	var cancel context.CancelFunc
-	if opts.Timeout > 0 {
-		startCtx, cancel = context.WithTimeout(m.ctx, time.Duration(opts.Timeout))
-		defer cancel()
-	}
-	if err := proc.Start(startCtx, os.Environ(), lc); err != nil {
+	if err := proc.Start(m.ctx, os.Environ(), lc); err != nil {
 		return -1, "", "", err
 	}
+
+	// Arm the timeout watchdog before parking. A goroutine is used rather than
+	// time.AfterFunc because this goroutine is about to park inside the scripting
+	// engine and block on proc.Wait() — it cannot wait for a timer callback. The
+	// watchdog exits on proc.Done() (or after killing), so it is bounded by the
+	// process lifetime or the timeout, never leaked. timedOut is read only after
+	// the wait completes; the race detector confirms the handoff.
+	timedOut := false
+	var timedOutMu sync.Mutex
+	if opts.Timeout > 0 {
+		go func() {
+			timer := time.NewTimer(time.Duration(opts.Timeout))
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				timedOutMu.Lock()
+				timedOut = true
+				timedOutMu.Unlock()
+				_ = proc.Kill()
+			case <-proc.Done():
+			}
+		}()
+	}
+
 	if m.gate != nil {
 		m.gate.Park()
 	}
@@ -227,11 +284,14 @@ func (m *ProcessModule) oneshot(opts runOpts, lc domain.LogConfig) (code int, st
 	if m.gate != nil {
 		m.gate.Unpark()
 	}
+	timedOutMu.Lock()
+	overtime := timedOut
+	timedOutMu.Unlock()
+	if overtime {
+		return code, "", "", fmt.Errorf("process %q timed out", opts.Process.BinaryPath)
+	}
 	if err != nil {
 		return code, "", "", err
-	}
-	if startCtx.Err() == context.DeadlineExceeded {
-		return code, "", "", fmt.Errorf("process %q timed out", opts.Process.BinaryPath)
 	}
 	if lc.Stdout == domain.LogDestCapture {
 		stdout, stderr = proc.Output()

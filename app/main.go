@@ -42,7 +42,7 @@ func main() {
 	reaper := system.NewReaper(func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "[reaper] "+format+"\n", args...)
 	})
-	if err := reaper.Start(ctx); err != nil {
+	if err := reaper.Start(reaperCtx()); err != nil {
 		fmt.Fprintln(os.Stderr, "failed to start reaper:", err)
 		os.Exit(1)
 	}
@@ -82,7 +82,7 @@ func main() {
 		),
 	)
 
-	if err := app.Start(ctx); err != nil {
+	if err := app.Start(startCtx(ctx)); err != nil {
 		var ee *domain.ExitError
 		if errors.As(err, &ee) {
 			os.Exit(ee.Code)
@@ -95,6 +95,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// reaperCtx returns the context the zombie reaper runs under. It MUST NOT be
+// the signal context: the reaper's wait loop stops reaping when its context is
+// cancelled, so binding it to SIGTERM disabled reaping at the exact moment
+// shutdown needs it. The supervised child's exit then went unreaped (a
+// persistent zombie), proc.Done() never fired, and every drain waited out its
+// full timeout while the app had already exited. Reaping must outlive the
+// signal — teardown is reaper.Stop, which main defers.
+func reaperCtx() context.Context { return context.Background() }
+
+// startCtx returns the context fx.Start runs under. fx aborts Start the moment
+// that context is done, WITHOUT waiting for the OnStart hooks — and the CLI
+// lives in one of those hooks (registerRootCmd → rootCmd.Execute, which blocks
+// for the whole supervised chain). Handing fx the SIGTERM-derived context
+// therefore made a signal abort startup instantly: main reached os.Exit while
+// the chain was still draining, killing ezx and its children before the
+// configured drain timeout could be honored. The signal context is still
+// injected into scripts (fx.Provide above), so it still drives the chain's own
+// cancellation and graceful drain; only fx's startup abort is disabled.
+// WithoutCancel keeps fx.Start cancellable by its own hook errors while
+// detaching it from the signal.
+func startCtx(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
 }
 
 // startHealthServer starts the process-wide health HTTP server. It listens
