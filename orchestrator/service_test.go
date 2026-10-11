@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -80,6 +82,36 @@ func (f *fakeLogger) Warn(string, ...any)       {}
 func (f *fakeLogger) Error(string, ...any)      {}
 func (f *fakeLogger) Enabled(logger.Level) bool { return false }
 
+// recordingLogger captures formatted log lines so tests can assert on them.
+type recordingLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (r *recordingLogger) log(level, msg string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lines = append(r.lines, level+":"+fmt.Sprintf(msg, args...))
+}
+
+func (r *recordingLogger) Debug(m string, a ...any)  { r.log("DEBUG", m, a...) }
+func (r *recordingLogger) Info(m string, a ...any)   { r.log("INFO", m, a...) }
+func (r *recordingLogger) Warn(m string, a ...any)   { r.log("WARN", m, a...) }
+func (r *recordingLogger) Error(m string, a ...any)  { r.log("ERROR", m, a...) }
+func (r *recordingLogger) Enabled(logger.Level) bool { return true }
+
+// contains reports whether any recorded line contains substr.
+func (r *recordingLogger) contains(substr string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, l := range r.lines {
+		if strings.Contains(l, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 // newTestService wires fakes into a Service.
 func newTestService(procs map[string]*fakeProc) *Service {
 	return NewService(
@@ -142,6 +174,7 @@ func testDeps() Deps {
 }
 
 var _ logger.Logger = (*fakeLogger)(nil)
+var _ logger.Logger = (*recordingLogger)(nil)
 var _ process.ProcessRepository = (*fakeProc)(nil)
 
 // TestRunOptionalChildNonFatal verifies that an Optional child that exits
@@ -1339,5 +1372,45 @@ func TestOneshotInitDAGExecFiresAfterOneshots(t *testing.T) {
 	case <-stanza.done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("stanza-create oneshot never completed before exec fired")
+	}
+}
+
+// TestReadinessSuccessIsLogged guards the UX fix: a successful readiness phase
+// must announce itself. Without it, a healthy boot prints "waiting for
+// readiness" and then goes silent, which is indistinguishable from a hang.
+func TestReadinessSuccessIsLogged(t *testing.T) {
+	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 0, nil)}
+	log := &recordingLogger{}
+	svc := NewService(
+		func(node domain.ProcessNode) process.ProcessRepository { return procs[node.Name] },
+		log, nil, testDeps(),
+	)
+
+	// A TCP listener that is definitely open, so the readiness probe passes.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	_ = svc.Run(ctx, domain.ProcessChain{Roots: []domain.ProcessNode{
+		{
+			Name:    "svc",
+			Process: domain.Process{BinaryPath: "/bin/true"},
+			Readiness: &domain.Probe{
+				Type: domain.ProbeTypeTCP, TCP: domain.TCPProbe{Host: "127.0.0.1", Port: port},
+				Interval: 10 * time.Millisecond, Timeout: 10 * time.Millisecond, MaxAttempts: 1,
+			},
+		},
+	}})
+
+	if !log.contains("started successfully") {
+		t.Fatalf("readiness success not logged; got lines: %v", log.lines)
 	}
 }

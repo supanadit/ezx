@@ -700,11 +700,8 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 	// A JS-driven ReadinessFunc overrides the declarative Readiness probe; both
 	// then set the health/readiness state and fire OnReady identically.
 	if node.ReadinessFunc != nil {
-		s.log.Info("[%s] waiting for readiness (callback)", node.Name)
 		ready := s.pollReadinessFunc(ctx, node, co)
-		if !ready {
-			s.log.Error("[%s] never became ready", node.Name)
-		}
+		s.reportReadiness(node, ready)
 		if node.Health != nil && s.health != nil {
 			s.health.SetReady(ready)
 		}
@@ -712,20 +709,17 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 			co.runCallback(node.Name, node.OnReady)
 		}
 	} else if node.Readiness != nil {
-		s.log.Info("[%s] waiting for readiness", node.Name)
-		ready, err := s.deps.Probes.Check(ctx, *node.Readiness)
-		if err != nil {
-			s.log.Warn("[%s] readiness probe error: %v", node.Name, err)
-		}
-		if !ready {
-			s.log.Error("[%s] never became ready", node.Name)
-		}
+		ready := s.awaitReadiness(ctx, node)
+		s.reportReadiness(node, ready)
 		if node.Health != nil && s.health != nil {
 			s.health.SetReady(ready)
 		}
 		if ready {
 			co.runCallback(node.Name, node.OnReady)
 		}
+	} else {
+		// No readiness gate: the node is usable the moment it has started.
+		s.reportReadiness(node, true)
 	}
 	co.signalReady(e)
 
@@ -818,6 +812,37 @@ func (s *Service) runOneshot(ctx context.Context, e *nodeEntry, co *coordinator)
 			return s.exitCodeErr(code, werr) // fatal unless Optional
 		}
 	}
+}
+
+// awaitReadiness runs the node's declarative readiness probe, returning whether
+// the node became ready. A single-attempt probe runs first so that the
+// "waiting for readiness" line is only printed when the app is genuinely not
+// ready yet (an app that is ready immediately never sees it).
+func (s *Service) awaitReadiness(ctx context.Context, node domain.ProcessNode) bool {
+	quick := *node.Readiness
+	quick.MaxAttempts = 1
+	if ready, err := s.deps.Probes.Check(ctx, quick); ready {
+		return true
+	} else if err != nil && ctx.Err() == nil {
+		s.log.Warn("[%s] readiness probe error: %v", node.Name, err)
+	}
+	s.log.Info("[%s] waiting for readiness", node.Name)
+	ready, err := s.deps.Probes.Check(ctx, *node.Readiness)
+	if err != nil && ctx.Err() == nil {
+		s.log.Warn("[%s] readiness probe error: %v", node.Name, err)
+	}
+	return ready
+}
+
+// reportReadiness logs the outcome of a node's readiness phase. Success is
+// logged loudly on purpose: without it a healthy boot prints "waiting for
+// readiness" and then goes silent, which is indistinguishable from a hang.
+func (s *Service) reportReadiness(node domain.ProcessNode, ready bool) {
+	if ready {
+		s.log.Info("[%s] started successfully", node.Name)
+		return
+	}
+	s.log.Error("[%s] never became ready", node.Name)
 }
 
 // pollReadinessFunc polls the node's ReadinessFunc callback until it returns
