@@ -20,16 +20,32 @@ func NewEditorModule(opener EditorOpener) *EditorModule {
 	return &EditorModule{opener: opener}
 }
 
-// Open returns a script-visible editor bound to the given path. The returned
-// Editor exposes read/write/upsert/insert/block methods to scripts.
-func (m *EditorModule) Open(path string) *FileEditor {
-	return &FileEditor{inner: m.opener.OpenFileEditor(path)}
+// Open returns a script-visible editor bound to the given path, using default
+// per-file options (space separator, "#" comment) unless an options object is
+// passed. The returned Editor exposes read/write/upsert/insert/block methods
+// plus the fluent verbs (property/add/wrap/section/raw/fragment/define).
+//
+//	conf := editor.open(path)                       // defaults
+//	conf := editor.open(path, { comment: "//" })    // PHP comment style
+//	conf := editor.open(path, { separator: " = " }) // postgresql.conf style
+func (m *EditorModule) Open(path string, opts ...EditorOptions) *FileEditor {
+	o := EditorOptions{}.withDefaults()
+	if len(opts) > 0 {
+		o = opts[0].withDefaults()
+	}
+	return &FileEditor{inner: m.opener.OpenFileEditor(path), opts: o}
 }
 
 // FileEditor wraps domain.FileEditor so its methods are reflected onto the
-// script-visible object with friendly names.
+// script-visible object with friendly names. It also carries the per-file
+// options and the current scope view used by the fluent verbs (see
+// editor_scope.go).
 type FileEditor struct {
 	inner domain.FileEditor
+	// opts is the per-file profile (separator/comment) resolved at open time.
+	opts EditorOptions
+	// view is the current scope (nil = whole file).
+	view *scopedView
 }
 
 // Path returns the target file path.

@@ -91,6 +91,10 @@ var subObjectSurfaces = []apiSurface{
 		"path", "read", "readLines", "writeLines", "replace", "append",
 		"remove", "ensure", "upsert", "insertBefore", "insertAfter",
 		"replaceBlock", "setBlock",
+		// Fluent, human-readable verbs (0.8.0). Additive: no existing verb
+		// changed semantics, so this stays under the same major surface.
+		"property", "line", "add", "addAll", "repeat", "raw", "wrap", "section",
+		"sectionNamed", "reset", "removeScope", "fragment", "define",
 	}},
 	{name: "process.spawn() → ProcessHandle", typ: reflect.TypeOf(&ProcessHandle{}), methods: []string{
 		"start", "wait", "signal", "kill", "pid",

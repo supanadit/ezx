@@ -169,6 +169,19 @@ everything below is declared in JavaScript, no shell:
   env var into a config line automatically. Ops include `replace`, `append`,
   `ensure`, `set-property`, `insert`, `block`, with `createOnly` and
   `when: { name, value }` conditionals.
+- **Fluent editor** — `editor.open(path)` returns a handle with verbs that
+  mirror the file's structure, so scripts never hand-assemble config text:
+  `property(key, value)` sets a directive in place; `add(key, value)` appends a
+  repeatable directive idempotently; `wrap(open, close)` nests a structural
+  block (`<IfModule> … </IfModule>`) and returns a scoped handle;
+  `section(name)` / `sectionNamed(name, begin, end)` owns a comment-delimited
+  region; `reset()` clears a scope's body so repeatable directives don't
+  accumulate; `fragment(name, path, { after })` includes a shipped source file
+  (e.g. a `.php` fragment) under a `BEGIN/END ezx:<name>` fence so application
+  code is never written as a JS string; `define(name, value)` sets a PHP
+  `define()` with type-aware quoting; `raw(text)` writes verbatim multi-line
+  content. Pass an options object (`{ separator: " = ", comment: "//" }`) for
+  non-space/PHP file styles. Every verb writes immediately and is idempotent.
 - **env→args** — `argOperations` build CLI flags from env: if-set values,
   if-truthy bare flags, comma/space list splits, pattern enumeration with name
   transforms, and custom callbacks.
@@ -282,7 +295,7 @@ The aggregate module exposed to scripts:
 | Namespace   | Purpose                                                                       |
 | ----------- | ----------------------------------------------------------------------------- |
 | `env`       | Read env with defaults, `isTruthy`, pattern enumeration                       |
-| `editor`    | Imperative file editing (`open`, `upsert`, `replace`, `append`, `remove`)     |
+| `editor`    | File editing — low-level (`open`, `upsert`, `replace`, `append`, `remove`) **and fluent** (`property`, `add`, `wrap`, `section`, `raw`) |
 | `fs`        | `mkdirAll`, `chmod`, `chownRecursive`, `readDir`, `exists`, `remove`, `umask`, `copy`/`copyTree` (cp -a) |
 | `net`       | Native HTTP client (`http`) + streaming download with SHA-256 verify (`download`) — no curl |
 | `crypto`    | `sha256`, `sha256File`, `base64Encode`/`base64Decode`, `randomHex` — no sha256sum |
@@ -309,6 +322,9 @@ go build -o ezx ./app
 
 # Config builder demo — renders postgresql.conf, pg_hba.conf, pgbackrest.conf, INI
 ./ezx bootstrap examples/bootstrap/config-builder.js
+
+# Fluent editor — property/add/wrap/section/raw, no hand-assembled config text
+./ezx bootstrap examples/bootstrap/fluent-editor.js
 
 # Declarative env-to-CLI-argument building
 PROMETHEUS_ENABLE_WEB_LIFECYCLE=true \

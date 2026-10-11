@@ -19,14 +19,14 @@ if (limit) {
   if (!/^\d+[kKmMgG]?$/.test(limit)) {
     throw new Error("PHP_MEMORY_LIMIT must be a size like 512M, got " + limit);
   }
-  phpIni.upsert(/^\s*memory_limit\s*=/, "memory_limit = " + limit);
+  phpIni.upsert("^\\s*memory_limit\\s*=", "memory_limit = " + limit);
   log.info("php.ini memory_limit = %s", limit);
 }
 
 // A second, imperative upsert from a different env var.
 const maxExec = env.get("PHP_MAX_EXECUTION_TIME", "");
 if (maxExec) {
-  phpIni.upsert(/^\s*max_execution_time\s*=/, "max_execution_time = " + maxExec);
+  phpIni.upsert("^\\s*max_execution_time\\s*=", "max_execution_time = " + maxExec);
   log.info("php.ini max_execution_time = %s", maxExec);
 }
 
