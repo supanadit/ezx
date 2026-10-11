@@ -20,9 +20,9 @@ const { chain } = require("ezx");
 const dir = "/tmp/ezx-app-rotate";
 
 chain.run({
-  // Keep ezx as PID 1 so it can supervise and signal; without this a lone node
-  // would be exec'd and rotation would have nothing to signal.
-  execDefault: false,
+  // ezx stays PID 1 by default: a lone node is supervised, not exec'd, so it can
+  // be signalled and rotated. (execDefault: true would hand PID 1 to the app and
+  // leave the rotation watcher with nothing to signal.)
   nodes: [
     {
       name: "writer",
