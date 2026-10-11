@@ -7,8 +7,8 @@
 # inside a container and asserts:
 #
 #   1. supervised mode keeps ezx as PID 1 and reaps orphaned children
-#   2. the explicit execDefault:false opt-out also keeps ezx as PID 1
-#   3. a lone node without supervision opts into exec (ezx disappears) and warns
+#   2. a lone node is supervised by default (safe default: ezx stays PID 1)
+#   3. execDefault:true opts a lone node back into the implicit exec, and warns
 #   4. an exec node replaces PID 1 (the "init DAG -> exec main" pattern)
 #   5. SIGTERM reaches the supervised app and ezx drains gracefully
 #   6. no port is bound at all unless EZX_HEALTH_ADDR is set
@@ -94,23 +94,22 @@ run_attached() {
 }
 
 # ---------------------------------------------------------------------------
-# 1 + 2. Supervised mode keeps ezx as PID 1, and orphans get reaped.
+# 1 + 2. A lone node is supervised by default (safe default), and the
+#        supervision it gets reaps orphans. `restart` is a supervision feature;
+#        omitting it changes nothing now that supervision is the default.
 # ---------------------------------------------------------------------------
-for variant in restart optout; do
+for variant in restart bare; do
 	if [ "$variant" = restart ]; then
 		label="supervised via restart policy"
 		policy='restart: { mode: "on-failure", maxRetries: 0, backoff: 1e9 },'
-		exec_default='true'
 	else
-		label="supervised via execDefault:false"
+		label="lone node supervised by default"
 		policy=''
-		exec_default='false'
 	fi
 
 	cat >"$workdir/sup.js" <<EOF
 const { chain } = require("ezx");
 chain.run({
-  execDefault: ${exec_default},
   nodes: [{
     name: "app",
     // Leaves a short-lived orphan behind: unreaped, it stays a zombie.
@@ -147,24 +146,45 @@ EOF
 done
 
 # ---------------------------------------------------------------------------
-# 3. A lone node with no restart/health/scheduler opts into exec: ezx warns and
-#    hands PID 1 to the app.
+# 3. A lone node with no supervision features is supervised by default: ezx
+#    stays PID 1 (no "exec'ing to become PID 1"). Opting in with
+#    execDefault:true restores the implicit exec and warns.
 # ---------------------------------------------------------------------------
-cat >"$workdir/lone.js" <<'EOF'
+cat >"$workdir/default.js" <<'EOF'
 const { chain } = require("ezx");
 chain.run({ nodes: [{ name: "app", process: { binaryPath: "/bin/sleep", arguments: ["3"] } }] });
 EOF
 
+out="$(run_attached "$workdir/default.js" 30)"
+if printf '%s' "$out" | grep -q "exec'ing to become PID 1"; then
+	fail "lone node was exec'd by default, want supervised"
+else
+	pass "lone node supervised by default (ezx stays PID 1)"
+fi
+if printf '%s' "$out" | grep -q "starting lifecycle"; then
+	pass "lone node went through the supervised lifecycle"
+else
+	fail "lone node never started its supervised lifecycle"
+fi
+
+cat >"$workdir/lone.js" <<'EOF'
+const { chain } = require("ezx");
+chain.run({
+  execDefault: true,
+  nodes: [{ name: "app", process: { binaryPath: "/bin/sleep", arguments: ["3"] } }],
+});
+EOF
+
 out="$(run_attached "$workdir/lone.js" 30)"
 if printf '%s' "$out" | grep -qi "supervision disabled"; then
-	pass "implicit exec warns that supervision is disabled"
+	pass "execDefault:true warns that supervision is disabled"
 else
-	fail "implicit exec did not warn (got: $(printf '%s' "$out" | tail -2 | tr '\n' ' '))"
+	fail "execDefault:true did not warn (got: $(printf '%s' "$out" | tail -2 | tr '\n' ' '))"
 fi
 if printf '%s' "$out" | grep -q "exec'ing to become PID 1"; then
-	pass "implicit exec hands PID 1 to the app"
+	pass "execDefault:true hands PID 1 to the app"
 else
-	fail "implicit exec log line missing"
+	fail "execDefault:true exec log line missing"
 fi
 
 # ---------------------------------------------------------------------------

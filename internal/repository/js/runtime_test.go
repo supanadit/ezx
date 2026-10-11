@@ -3,6 +3,7 @@ package js
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -138,12 +139,19 @@ func TestScriptProcessModule(t *testing.T) {
 // buildTestEngineWithRouter wires an Engine with the env + editor host
 // modules, a shared echo router (for ezx.api), and a capturing logger.
 func buildTestEngineWithRouter(t *testing.T, router *echo.Echo) (*Engine, *bytes.Buffer) {
+	return buildTestEngineWithRouterCtx(t, context.Background(), router)
+}
+
+// buildTestEngineWithRouterCtx is buildTestEngineWithRouter with a caller-owned
+// context, so a test can cancel host-module blocking calls (process.sleep)
+// instead of waiting them out.
+func buildTestEngineWithRouterCtx(t *testing.T, ctx context.Context, router *echo.Echo) (*Engine, *bytes.Buffer) {
 	t.Helper()
 	reg := runtime.NewRegistry()
 	var buf bytes.Buffer
 	log := system.NewLogger()
 	log.SetOutput(&buf)
-	registerTestHostModule(reg, context.Background(), log, func(node domain.ProcessNode) process.ProcessRepository {
+	registerTestHostModule(reg, ctx, log, func(node domain.ProcessNode) process.ProcessRepository {
 		return system.NewProcessRepository(node, nil)
 	}, nil, router)
 	return NewEngine(reg), &buf
@@ -151,10 +159,32 @@ func buildTestEngineWithRouter(t *testing.T, router *echo.Echo) (*Engine, *bytes
 
 func TestScriptSchedulerBuildAndAPI(t *testing.T) {
 	router := echo.New()
-	engine, _ := buildTestEngineWithRouter(t, router)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The host module shares this context, so cancel() releases process.sleep
+	// immediately instead of waiting out the sleep duration.
+	engine, _ := buildTestEngineWithRouterCtx(t, ctx, router)
 
-	src := `
-		const { scheduler, api } = require("ezx");
+	// Readiness is signalled through the filesystem, not by polling the echo
+	// router: the script goroutine mutates the router while the test goroutine
+	// would be reading router.Routes(), and echo's router is not safe for
+	// concurrent read-during-write (that read/write pair is a data race). A
+	// sentinel file written right after api.post is a race-free handshake.
+	ready := filepath.Join(t.TempDir(), "route-registered")
+
+	// The API gate only admits a route handler while the script is parked in a
+	// blocking host call; entering the VM while a script frame is live would race
+	// it. So the script registers its route and then parks in process.sleep,
+	// which is exactly the state a real entrypoint is in while blocked in
+	// chain.run. Hitting the route after RunString returned would test the
+	// failure path, not the feature (the script has finished and is no longer
+	// parked).
+	//
+	// The sleep is long and the script's context is cancelled after the
+	// assertions, so the parked window is deterministic instead of racing a
+	// fixed duration.
+	src := fmt.Sprintf(`
+		const { scheduler, api, process, fs } = require("ezx");
 		// scheduler.build validates a valid cron and returns the config (no throw).
 		scheduler.build({
 			schedule: { expression: "20 2,8,14,20 * * *", timezone: "UTC" },
@@ -170,21 +200,55 @@ func TestScriptSchedulerBuildAndAPI(t *testing.T) {
 		if (scheduler.parse("*/15 * * * *") !== "*/15 * * * *") throw new Error("parse failed");
 		// Register a user route; the handler's return is JSON-encoded.
 		api.post("/backup/full", () => ({ ok: true, type: "full" }));
-	`
-	if err := engine.RunString(context.Background(), src); err != nil {
-		t.Fatalf("RunString: %v", err)
+		// Handshake: the route is registered, so the test may hit it.
+		fs.write(%q, "ready\n");
+		// Park so the route handler may enter the VM (mirrors chain.run).
+		process.sleep(60e9);
+	`, ready)
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- engine.RunString(ctx, src) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !fileExists(ready) {
+		if time.Now().After(deadline) {
+			t.Fatal("route /backup/full never registered")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
-	// Hit the registered route and assert JSON response.
-	req := httptest.NewRequest(http.MethodPost, "/backup/full", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("POST /backup/full code = %d, want 200", rec.Code)
+	// Registration precedes the park by a few instructions, so a handler admitted
+	// before the park correctly returns 500 ErrNotParked; retry until it is held
+	// in the parked window.
+	var rec *httptest.ResponseRecorder
+	for {
+		req := httptest.NewRequest(http.MethodPost, "/backup/full", nil)
+		rec = httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("POST /backup/full never succeeded (last code=%d body=%s)", rec.Code, rec.Body.String())
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	if !strings.Contains(rec.Body.String(), `"ok":true`) {
 		t.Fatalf("body = %q, want ok:true", rec.Body.String())
 	}
+
+	// Release the parked script and wait for it to finish.
+	cancel()
+	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunString: %v", err)
+	}
+}
+
+// fileExists reports whether path exists, used as a race-free handshake signal
+// between the script goroutine and the test goroutine.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func TestScriptYamlBuild(t *testing.T) {
