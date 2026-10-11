@@ -65,8 +65,8 @@ func (f *fakeProc) Kill() error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeProc) PID() int               { return 1 }
-func (f *fakeProc) Done() <-chan struct{}  { return f.done }
+func (f *fakeProc) PID() int              { return 1 }
+func (f *fakeProc) Done() <-chan struct{} { return f.done }
 func (f *fakeProc) Output() (string, string) {
 	return "", ""
 }
@@ -91,6 +91,48 @@ func newTestService(procs map[string]*fakeProc) *Service {
 		testDeps(),
 	)
 }
+
+// fakeExec records Exec calls instead of replacing the test process. A real
+// syscall.Exec would terminate the test binary, so the exec path is only
+// observable through this port.
+type fakeExec struct {
+	mu     sync.Mutex
+	called int
+	last   domain.Process
+}
+
+func (f *fakeExec) Exec(p domain.Process, _ []string) error {
+	f.mu.Lock()
+	f.called++
+	f.last = p
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeExec) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.called
+}
+
+// newTestServiceWithExec wires a fake exec port alongside the real provisioning
+// and arg-building adapters, so exec-mode decisions can be asserted without
+// replacing the test process.
+func newTestServiceWithExec(procs map[string]*fakeProc) (*Service, *fakeExec) {
+	ex := &fakeExec{}
+	d := testDeps()
+	d.Exec = ex
+	return NewService(
+		func(node domain.ProcessNode) process.ProcessRepository {
+			return procs[node.Name]
+		},
+		&fakeLogger{},
+		nil,
+		d,
+	), ex
+}
+
+var _ ProcessExecer = (*fakeExec)(nil)
 
 // testDeps supplies the supervisor's driven-side ports backed by the real OS
 // adapter (the orchestrator tests exercise real provisioning/arg-building).
@@ -207,7 +249,7 @@ func TestLifecycleCallbacks(t *testing.T) {
 			{
 				Name: "svc",
 				Restart: &domain.RestartPolicy{
-					Mode:      domain.RestartNever,
+					Mode:       domain.RestartNever,
 					MaxRetries: 1,
 				},
 				OnStart: func() {
@@ -563,37 +605,116 @@ func TestLoneLeafRootDefaultsToExecSupervisesOnHealth(t *testing.T) {
 	}
 }
 
-// TestLoneLeafExecDefaultOptOut verifies that an explicit chain-level
-// execDefault: false keeps a lone leaf node supervised instead of exec'ing it:
-// ezx stays PID 1 and the node's process handle is started, so its supervision
-// duties (zombie reaping, signal forwarding) stay active.
-func TestLoneLeafExecDefaultOptOut(t *testing.T) {
+// TestLoneLeafSupervisedByDefault verifies the SAFE DEFAULT: a lone leaf node
+// with no exec opt-in is supervised (not exec'd), so ezx stays PID 1 and keeps
+// its init duties (zombie reaping, signal forwarding, health). This guards the
+// regression where a lone node was silently exec'd and its `user:`/readiness
+// declarations were discarded.
+func TestLoneLeafSupervisedByDefault(t *testing.T) {
 	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 0, nil)}
 	svc := newTestService(procs)
 
-	noExec := false
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	err := svc.Run(ctx, domain.ProcessChain{
-		ExecDefault: &noExec,
 		Roots: []domain.ProcessNode{
 			{Name: "svc", Process: domain.Process{BinaryPath: "/bin/true"}},
 		},
 	})
 	if err != nil {
-		t.Fatalf("execDefault:false lone leaf should be supervised, got error: %v", err)
+		t.Fatalf("lone leaf should be supervised by default, got error: %v", err)
 	}
 	procs["svc"].mu.Lock()
 	started := len(procs["svc"].started)
 	procs["svc"].mu.Unlock()
 	if started < 1 {
-		t.Fatalf("execDefault:false lone leaf started %d times, want >=1 (supervised, not exec'd)", started)
+		t.Fatalf("lone leaf started %d times, want >=1 (supervised, not exec'd)", started)
 	}
 }
 
-// TestExplicitlyNoExecDefault locks the opt-out semantics: only an explicit
-// false disables the implicit exec; unset (nil) and true preserve it.
-func TestExplicitlyNoExecDefault(t *testing.T) {
+// TestLoneLeafExecDefaultOptIn verifies the explicit escape hatch: a chain that
+// really wants the app as PID 1 sets execDefault: true, and a node with no
+// supervision features is then exec'd (the test Exec fake records the call
+// instead of replacing the test process).
+func TestLoneLeafExecDefaultOptIn(t *testing.T) {
+	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 0, nil)}
+	svc, ex := newTestServiceWithExec(procs)
+
+	yes := true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = svc.Run(ctx, domain.ProcessChain{
+		ExecDefault: &yes,
+		Roots: []domain.ProcessNode{
+			{Name: "svc", Process: domain.Process{BinaryPath: "/bin/true"}},
+		},
+	})
+	// The fake Exec records the call instead of replacing the test process.
+	if ex.count() == 0 {
+		t.Fatalf("execDefault:true lone leaf should have been exec'd")
+	}
+}
+
+// TestLoneLeafSupervisionRequestBeatsExecDefault guards the second half of the
+// fix: even with execDefault: true, a node that declares a supervision feature
+// must not be implicitly exec'd, because the feature would be silently
+// discarded (this is the exact shape that broke a readiness-probing container).
+func TestLoneLeafSupervisionRequestBeatsExecDefault(t *testing.T) {
+	procs := map[string]*fakeProc{"svc": newFakeProc("svc", 0, nil)}
+	svc, ex := newTestServiceWithExec(procs)
+
+	yes := true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := svc.Run(ctx, domain.ProcessChain{
+		ExecDefault: &yes,
+		Roots: []domain.ProcessNode{
+			{
+				Name:    "svc",
+				Process: domain.Process{BinaryPath: "/bin/true"},
+				// A readiness probe means "supervise and probe me".
+				Readiness: &domain.Probe{Type: domain.ProbeTypeTCP, TCP: domain.TCPProbe{Host: "127.0.0.1", Port: 1}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("node with readiness must be supervised, got error: %v", err)
+	}
+	if ex.count() != 0 {
+		t.Fatalf("node declaring readiness must not be exec'd")
+	}
+	procs["svc"].mu.Lock()
+	started := len(procs["svc"].started)
+	procs["svc"].mu.Unlock()
+	if started < 1 {
+		t.Fatalf("node declaring readiness started %d times, want >=1 (supervised)", started)
+	}
+}
+
+// TestRequestsSupervision locks the supervision-intent predicate.
+func TestRequestsSupervision(t *testing.T) {
+	cases := []struct {
+		name string
+		node domain.ProcessNode
+		want bool
+	}{
+		{"bare node", domain.ProcessNode{}, false},
+		{"restart", domain.ProcessNode{Restart: &domain.RestartPolicy{Mode: "always"}}, true},
+		{"readiness", domain.ProcessNode{Readiness: &domain.Probe{}}, true},
+		{"forward signals", domain.ProcessNode{ForwardSignals: []string{"SIGTERM"}}, true},
+		{"oneshot", domain.ProcessNode{Oneshot: true}, true},
+		{"log rotate", domain.ProcessNode{LogRotate: &domain.LogRotateConfig{}}, true},
+	}
+	for _, tc := range cases {
+		if got := requestsSupervision(tc.node); got != tc.want {
+			t.Errorf("%s: requestsSupervision = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestExplicitlyYesExecDefault locks the opt-in semantics: only an explicit
+// true enables the implicit exec; unset (nil) and false keep the safe default.
+func TestExplicitlyYesExecDefault(t *testing.T) {
 	no := false
 	yes := true
 	cases := []struct {
@@ -601,13 +722,13 @@ func TestExplicitlyNoExecDefault(t *testing.T) {
 		in   *bool
 		want bool
 	}{
-		{"unset keeps default", nil, false},
-		{"true keeps default", &yes, false},
-		{"false disables", &no, true},
+		{"unset keeps safe default", nil, false},
+		{"false keeps safe default", &no, false},
+		{"true enables implicit exec", &yes, true},
 	}
 	for _, tc := range cases {
-		if got := explicitlyNoExecDefault(tc.in); got != tc.want {
-			t.Errorf("%s: explicitlyNoExecDefault = %v, want %v", tc.name, got, tc.want)
+		if got := explicitlyYesExecDefault(tc.in); got != tc.want {
+			t.Errorf("%s: explicitlyYesExecDefault = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -791,8 +912,8 @@ func TestRunReadinessFuncBecomesReady(t *testing.T) {
 	onReady := 0
 	chain := domain.ProcessChain{
 		Roots: []domain.ProcessNode{{
-			Name:     "parent",
-			Children: []domain.ProcessNode{{Name: "child", NeedParentReady: true}},
+			Name:      "parent",
+			Children:  []domain.ProcessNode{{Name: "child", NeedParentReady: true}},
 			Readiness: &domain.Probe{Interval: time.Millisecond, MaxAttempts: 100},
 			ReadinessFunc: func() bool {
 				mu.Lock()
@@ -851,8 +972,8 @@ func TestRunReadinessFuncNeverReadySpawnsChildren(t *testing.T) {
 
 	chain := domain.ProcessChain{
 		Roots: []domain.ProcessNode{{
-			Name:     "parent",
-			Children: []domain.ProcessNode{{Name: "child", NeedParentReady: true}},
+			Name:      "parent",
+			Children:  []domain.ProcessNode{{Name: "child", NeedParentReady: true}},
 			Readiness: &domain.Probe{Interval: time.Millisecond, MaxAttempts: 2},
 			ReadinessFunc: func() bool {
 				return false

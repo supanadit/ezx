@@ -83,29 +83,38 @@ Every node selects how its main process is launched:
 - **Mode B — supervised (default)**: ezx **stays PID 1**. Each node gets
   `restart`, `health`/readiness HTTP, `scheduler`, `forwardSignals`, `probe`,
   `shutdown`, and dependency edges via `dependsOn`/`dependsOnEdges` (or the
-  legacy `children` tree form). ezx reaps zombies and forwards signals.
-- **Exception — a lone node is auto-exec'd.** A chain with a **single** node
-  that sets no `restart`, no `scheduler` and no `health` is exec'd as PID 1
-  automatically, exactly as if it had declared `exec: true`. This is the
-  classic "set up then vanish" entrypoint, but it means ezx is gone: **no
-  zombie reaping and no signal forwarding**. ezx logs a warning when this
-  implicit exec fires.
-
-  Keep ezx as PID 1 either by declaring the supervision you want
-  (`restart`, `health` or `scheduler`) or by opting out explicitly:
+  legacy `children` tree form). ezx reaps zombies and forwards signals. This is
+  what happens to a lone node unless it explicitly asks otherwise — see below.
+- **Lone nodes are supervised too.** A single-node chain is **not** exec'd
+  implicitly. Supervision is the safe default, because the implicit exec
+  silently dropped zombie reaping, signal forwarding, health, readiness and log
+  rotation, and ran the app as root regardless of `user:`. To hand PID 1 to your
+  app you opt in explicitly, either per node or per chain:
 
   ```js
   chain.run({
-    execDefault: false, // stay PID 1 and supervise this lone node
+    nodes: [{ name: "app", exec: true, process: { binaryPath: "/usr/bin/app", user: "app" } }],
+  });
+
+  // or, keeping the old implicit-lone-node behaviour for a whole chain:
+  chain.run({
+    execDefault: true,
     nodes: [{ name: "app", process: { binaryPath: "/usr/bin/app" } }],
   });
   ```
 
-  Reach for the opt-out whenever the lone node is a real long-running service
-  rather than a fire-and-forget entrypoint: without a `wait()`-ing PID 1, any
-  process the app orphans is reparented to PID 1 and lingers as a zombie
-  forever. `execDefault: true` (or leaving it unset) preserves the implicit
-  exec.
+  `execDefault: true` only applies to a lone node with **no** supervision
+  features declared; a node that sets `restart`, `scheduler`, `health`,
+  `readiness`, `forwardSignals`, `logRotate` or `oneshot` is always supervised,
+  since that intent would otherwise be silently discarded. Reach for `exec:
+  true` only when the node really is a fire-and-forget entrypoint: without a
+  `wait()`-ing PID 1, any process the app orphans is reparented to PID 1 and
+  lingers as a zombie forever.
+
+  When an exec node declares `user`, ezx drops privileges (setgroups/setgid/
+  setuid) before `syscall.Exec`, so the app becomes PID 1 **as that user** rather
+  than as root. If no `user` is set, ezx warns that the app will run with ezx's
+  uid.
 
 ezx is an **alternative to tini and dumb-init** that goes further. Those tools
 reap zombies and forward a couple of signals — and that's the whole job. ezx
@@ -279,7 +288,7 @@ The aggregate module exposed to scripts:
 | `crypto`    | `sha256`, `sha256File`, `base64Encode`/`base64Decode`, `randomHex` — no sha256sum |
 | `archive`   | `create`/`extract` for tar, tar.gz, zip, .gz — no tar/gunzip            |
 | `process`   | Low-level spawn / signal / wait / exec, `sleep`, `run`/`capture` with `timeout` — no sleep/timeout |
-| `chain`     | High-level declarative process graph (`chain.run({ nodes: [...] })`; chain-level `execDefault: false` keeps ezx as PID 1 for a lone node) |
+| `chain`     | High-level declarative process graph (`chain.run({ nodes: [...] })`; `execDefault: true` opts a lone node into the implicit PID-1 exec — the default is to supervise) |
 | `config`    | Declarative config builder (`key=value`, tables, INI, fluent builder)         |
 | `yaml`      | Deterministic YAML serialization                                              |
 | `scheduler` | Cron-driven scheduled processes with gates                                    |

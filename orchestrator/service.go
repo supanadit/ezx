@@ -265,14 +265,14 @@ func (s *Service) runDAG(ctx context.Context, chain domain.ProcessChain) error {
 		e.pending = len(e.edges)
 	}
 
-	// A lone leaf node with no restart/scheduler opts into exec (PID 1). The
-	// chain may opt out explicitly with execDefault: false — needed when the
-	// node is the one main process but ezx must stay PID 1 for its init duties
-	// (zombie reaping, signal forwarding, health).
+	// SAFE DEFAULT: a lone node is supervised, not exec'd. Replacing PID 1 is
+	// an explicit, deliberate choice (`exec: true`); assuming it silently
+	// discarded supervision duties (zombie reaping, signal forwarding, health,
+	// readiness, log rotation) and ran the application as root regardless of
+	// `user:`. `execDefault: true` restores the old implicit behaviour for
+	// callers that relied on it.
 	co.execDefault = len(co.entries) == 1 &&
-		co.entries[0].node.Restart == nil &&
-		co.entries[0].node.Scheduler == nil &&
-		!explicitlyNoExecDefault(chain.ExecDefault)
+		explicitlyYesExecDefault(chain.ExecDefault)
 
 	var wg sync.WaitGroup
 	for _, e := range co.entries {
@@ -504,11 +504,37 @@ func (s *Service) hasActiveSiblings() bool {
 	return s.active > 0
 }
 
-// explicitlyNoExecDefault reports whether the chain opted out of the implicit
-// lone-node exec (execDefault: false). A nil or true value keeps the default:
-// only an explicit false disables it.
-func explicitlyNoExecDefault(v *bool) bool {
-	return v != nil && !*v
+// explicitlyYesExecDefault reports whether the chain opted IN to the implicit
+// lone-node exec (execDefault: true). Only an explicit true enables it; unset
+// and false both keep ezx as PID 1 (the safe default).
+func explicitlyYesExecDefault(v *bool) bool {
+	return v != nil && *v
+}
+
+// requestsSupervision reports whether a node declares anything that only makes
+// sense while ezx supervises it. Any of these means the node must NOT be
+// implicitly exec'd into: the feature would be silently discarded.
+//
+//   - Restart    — supervise and restart on failure
+//   - Scheduler  — run on a cron ticker under supervision
+//   - Health     — keep ezx alive to serve /readyz
+//   - Readiness / ReadinessFunc — probe the node before signalling ready
+//   - ForwardSignals — relay signals from PID 1 to the node's process group
+//   - LogRotate  — watch and rotate logs the app writes itself
+//   - Oneshot    — run to completion, then report
+//
+// Readiness, ForwardSignals and LogRotate were previously ignored here, so a
+// lone node could ask to be probed or signalled and be exec'd anyway, with the
+// probe never running.
+func requestsSupervision(n domain.ProcessNode) bool {
+	return n.Restart != nil ||
+		n.Scheduler != nil ||
+		n.Health != nil ||
+		n.Readiness != nil ||
+		n.ReadinessFunc != nil ||
+		len(n.ForwardSignals) > 0 ||
+		n.LogRotate != nil ||
+		n.Oneshot
 }
 
 // runSingleNode drives a single node through its lifecycle: provision →
@@ -550,9 +576,12 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 	node.Process.Arguments = args
 
 	// exec and Health are mutually exclusive: exec replaces PID 1 (ezx
-	// vanishes), health requires ezx to stay alive. execDefault makes a lone
-	// chain node exec unless it opts into supervision via Health or Scheduler.
-	execNode := node.Exec || (co.execDefault && node.Health == nil && node.Scheduler == nil)
+	// vanishes), health requires ezx to stay alive. A node is exec'd only when it
+	// explicitly asked (`exec: true`) or the chain opted in via execDefault:
+	// true. Even then, a node that declares supervision features is not exec'd
+	// implicitly — those features would be silently discarded.
+	implicitExec := co.execDefault && !requestsSupervision(node)
+	execNode := node.Exec || implicitExec
 	if node.Exec && node.Health != nil {
 		return fmt.Errorf("node %q cannot have both Exec and Health set", node.Name)
 	}
@@ -569,12 +598,26 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 		if node.Exec {
 			s.log.Warn("exec node %q — supervision disabled (no zombie reaping / signal forwarding); ezx is replaced by the app as PID 1", node.Name)
 		} else {
-			// The implicit (lone-node) exec fires: supervision is off, so say so
-			// instead of letting one info line be the only hint.
-			s.log.Warn("single-node chain: exec mode for %q — supervision disabled (no zombie reaping / signal forwarding); set restart, health or scheduler, or execDefault: false, to keep ezx as PID 1", node.Name)
+			// The implicit (execDefault: true) exec fires: supervision is off, so
+			// say so instead of letting one info line be the only hint.
+			s.log.Warn("single-node chain: implicit exec mode for %q (execDefault: true) — supervision disabled (no zombie reaping / signal forwarding); pass execDefault: false to keep ezx as PID 1", node.Name)
+		}
+		// An exec node runs as PID 1 and cannot be reaped or signalled by ezx.
+		// Report the credential that will be in effect, since this is the one
+		// path where a wrong `user:` has the most severe consequences.
+		if node.Process.User != "" {
+			s.log.Info("[%s] exec with credentials: user=%s group=%s", node.Name, node.Process.User, node.Process.Group)
+		} else {
+			s.log.Warn("[%s] exec without user: the application will run with ezx's uid (%d) — set `user` to drop privileges", node.Name, os.Getuid())
 		}
 		s.log.Info("[%s] exec'ing to become PID 1", node.Name)
-		return s.deps.Exec.Exec(node.Process, env)
+		if err := s.deps.Exec.Exec(node.Process, env); err != nil {
+			// Exec only returns on failure; surface the wrapped, actionable error
+			// instead of a bare ENOENT with no binary name.
+			s.log.Error("[%s] exec failed: %v", node.Name, err)
+			return err
+		}
+		return nil
 	}
 
 	// A scheduled node runs its Process on a cron ticker (with manual triggers)
