@@ -139,6 +139,10 @@ imperative `process.run` one-shot, composed into the dependency graph:
 - **Mutually exclusive** with `exec`, `scheduler`, `health`, and
   `needParentReady` (a oneshot is "ready" only when it exits 0) — validated
   fail-fast at chain validation.
+- **`onStart` runs the init work.** It fires once after the process starts, so
+  a **callback-only** oneshot (no `process.binaryPath`) does its work there and
+  completes when it returns. `onExit` runs after the process exits. A `throw`
+  from either fails the node instead of being swallowed.
 
 The headline pattern is **"init DAG → exec main"**: a chain of init steps
 (initdb, stanza-create, migrations) run to completion, then the main long-running

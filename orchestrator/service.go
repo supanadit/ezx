@@ -211,17 +211,31 @@ type coordinator struct {
 // means the engine refused admission (e.g. the script resumed and is executing
 // again), and the callback is skipped rather than raced. A chain without a gate
 // runs the callback unconditionally.
-func (co *coordinator) runCallback(name string, fn func()) {
+//
+// A JS callback that throws crosses the goja boundary as a panic, and ezx has no
+// other recover on a node goroutine. runCallback recovers it and returns an
+// error instead, so a broken init callback fails its node (or is logged) rather
+// than crashing the whole entrypoint while the node still reports code=0.
+func (co *coordinator) runCallback(name string, fn func()) (err error) {
 	if fn == nil {
-		return
+		return nil
+	}
+	run := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("script callback panicked: %v", r)
+			}
+		}()
+		fn()
 	}
 	if co.gate == nil {
-		fn()
-		return
+		run()
+		return err
 	}
-	if !co.gate(fn) {
+	if !co.gate(run) {
 		co.s.log.Warn("[%s] script callback skipped: script engine is busy with the running script", name)
 	}
+	return err
 }
 
 // runDAG drives a normalized, validated flat chain. Every node runs in its own
@@ -648,7 +662,13 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 		return err
 	}
 	s.log.Info("[%s] started (pid=%d)", node.Name, proc.PID())
-	co.runCallback(node.Name, node.OnStart)
+	if err := co.runCallback(node.Name, node.OnStart); err != nil {
+		// The process is already up; drain it before failing the node so a
+		// throwing onStart does not leak a live child into the shutdown path.
+		s.log.Error("[%s] onStart failed: %v", node.Name, err)
+		_ = s.drain(ctx, proc, s.resolveShutdown(node))
+		return err
+	}
 	co.signalStarted(e)
 
 	// Start size-driven rotation for log files the process writes itself. The
@@ -706,7 +726,9 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 			s.health.SetReady(ready)
 		}
 		if ready {
-			co.runCallback(node.Name, node.OnReady)
+			if err := co.runCallback(node.Name, node.OnReady); err != nil {
+				s.log.Error("[%s] onReady failed: %v", node.Name, err)
+			}
 		}
 	} else if node.Readiness != nil {
 		ready := s.awaitReadiness(ctx, node)
@@ -715,7 +737,9 @@ func (s *Service) runSingleNode(ctx context.Context, e *nodeEntry, co *coordinat
 			s.health.SetReady(ready)
 		}
 		if ready {
-			co.runCallback(node.Name, node.OnReady)
+			if err := co.runCallback(node.Name, node.OnReady); err != nil {
+				s.log.Error("[%s] onReady failed: %v", node.Name, err)
+			}
 		}
 	} else {
 		// No readiness gate: the node is usable the moment it has started.
@@ -762,6 +786,19 @@ func (s *Service) runOneshot(ctx context.Context, e *nodeEntry, co *coordinator)
 		return err
 	}
 	s.log.Info("[%s] oneshot started (pid=%d)", node.Name, proc.PID())
+	// OnStart is documented on Process as the callback a callback-only node
+	// (empty BinaryPath) "completes immediately after … returns", and it is what
+	// a runOneshot JS init node uses to do its work. runSingleNode fires it; this
+	// path must too, or a callback-only oneshot silently does nothing and still
+	// reports code=0.
+	if cbErr := co.runCallback(node.Name, node.OnStart); cbErr != nil {
+		// The callback-only process is already "done"; a throwing onStart must
+		// fail the node so its dependents are skipped instead of proceeding
+		// against unperformed init work.
+		s.endActive()
+		s.log.Error("[%s] onStart failed: %v", node.Name, cbErr)
+		return cbErr
+	}
 
 	// On success, end the active window BEFORE signaling started+ready so the
 	// exec guard (hasActiveSiblings) never sees this oneshot as still active
@@ -785,7 +822,13 @@ func (s *Service) runOneshot(ctx context.Context, e *nodeEntry, co *coordinator)
 			code, werr := proc.Wait()
 			s.log.Info("[%s] oneshot finished (code=%d)", node.Name, code)
 			if node.OnExit != nil {
-				co.runCallback(node.Name, func() { node.OnExit(code) })
+				if exitErr := co.runCallback(node.Name, func() { node.OnExit(code) }); exitErr != nil {
+					// onExit is the only work a callback-only oneshot may do (it runs
+					// after the process exits), so a throw there must fail the node —
+					// otherwise it is swallowed and reported as code=0 success.
+					s.log.Error("[%s] onExit failed: %v", node.Name, exitErr)
+					return exitErr
+				}
 			}
 			if code == 0 {
 				// Success: unblock dependents (a oneshot is "ready" only when
@@ -895,7 +938,10 @@ func (s *Service) callReadinessFunc(co *coordinator, node domain.ProcessNode) bo
 		return false
 	}
 	ready := false
-	co.runCallback(node.Name, func() { ready = node.ReadinessFunc() })
+	if err := co.runCallback(node.Name, func() { ready = node.ReadinessFunc() }); err != nil {
+		co.s.log.Error("[%s] readinessFunc failed: %v", node.Name, err)
+		return false
+	}
 	return ready
 }
 
@@ -951,7 +997,9 @@ func (s *Service) supervise(ctx context.Context, node domain.ProcessNode, proc p
 			code, err := proc.Wait()
 			s.log.Info("[%s] process exited (code=%d)", node.Name, code)
 			if node.OnExit != nil {
-				co.runCallback(node.Name, func() { node.OnExit(code) })
+				if exitErr := co.runCallback(node.Name, func() { node.OnExit(code) }); exitErr != nil {
+					s.log.Error("[%s] onExit failed: %v", node.Name, exitErr)
+				}
 			}
 
 			shouldRestart := s.shouldRestart(node, code)

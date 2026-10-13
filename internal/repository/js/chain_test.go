@@ -250,6 +250,45 @@ func TestChainBindingNeedParentReadyLegacy(t *testing.T) {
 	}
 }
 
+// TestChainBindingCallbackThrowSurfaces verifies a throwing JS lifecycle
+// callback fails the chain with the thrown message instead of panicking the
+// entrypoint (ezx has no recover on a node goroutine, and a callback-only
+// oneshot would otherwise be reported as a code=0 success).
+func TestChainBindingCallbackThrowSurfaces(t *testing.T) {
+	_, err := runChainBinding(t, `
+		const { chain } = require("ezx");
+		chain.run({
+			nodes: [
+				{ name: "init", oneshot: true,
+				  onExit: (code) => { throw new Error("boom from onExit"); } },
+			],
+		});
+	`)
+	if err == nil {
+		t.Fatal("throwing onExit should surface an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "boom from onExit") {
+		t.Fatalf("error = %v, want it to carry the thrown message", err)
+	}
+}
+
+// TestChainBindingOneshotOnStartRuns verifies a callback-only oneshot node runs
+// its onStart (the documented contract for an empty binaryPath), so pure-JS
+// init steps actually perform their work.
+func TestChainBindingOneshotOnStartRuns(t *testing.T) {
+	_, err := runChainBinding(t, `
+		const { chain } = require("ezx");
+		chain.run({
+			nodes: [
+				{ name: "init", oneshot: true, onStart: () => {} },
+			],
+		});
+	`)
+	if err != nil {
+		t.Fatalf("RunString: %v", err)
+	}
+}
+
 // testOrchestratorDeps supplies the supervisor's driven-side ports backed by
 // the real OS adapter for the JS chain tests.
 func testOrchestratorDeps() orchestrator.Deps {

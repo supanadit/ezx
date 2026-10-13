@@ -1132,6 +1132,43 @@ func TestLoneOneshotRunsToCompletion(t *testing.T) {
 	}
 }
 
+// TestOneshotFiresOnStart verifies a oneshot node fires OnStart after its
+// process starts, mirroring runSingleNode. Regression: runOneshot originally
+// fired only OnExit, so a callback-only oneshot (empty BinaryPath, the form a
+// JS init node uses) silently did nothing yet still reported code=0.
+func TestOneshotFiresOnStart(t *testing.T) {
+	startC := make(chan string, 10)
+	init := newFakeProc("init", 0, startC)
+	procs := map[string]*fakeProc{"init": init}
+	svc := newTestService(procs)
+
+	var mu sync.Mutex
+	onStart, onExit := 0, 0
+	chain := domain.ProcessChain{Nodes: []domain.ProcessNode{
+		{
+			Name:    "init",
+			Oneshot: true,
+			OnStart: func() { mu.Lock(); onStart++; mu.Unlock() },
+			OnExit:  func(code int) { mu.Lock(); onExit++; mu.Unlock() },
+		},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Run(ctx, chain); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if onStart != 1 {
+		t.Fatalf("oneshot onStart fired %d times, want 1", onStart)
+	}
+	if onExit != 1 {
+		t.Fatalf("oneshot onExit fired %d times, want 1", onExit)
+	}
+}
+
 // TestOneshotExitZeroStartsDependents verifies D2: a oneshot that exits 0
 // signals started+ready, so its dependents start only after it completes.
 func TestOneshotExitZeroStartsDependents(t *testing.T) {
